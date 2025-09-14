@@ -1,5 +1,5 @@
-# --- main.py v6.1 (Poll Attribute Fix) ---
-# Corrects the path to access poll data to fix the forwarding error.
+# --- main.py v6.2 (Formatted Text Fix) ---
+# Fixes 'TextWithEntities' error by converting text to string before replacement.
 
 import os
 import asyncio
@@ -121,13 +121,16 @@ async def handle_forward_task(user_bot, bot_app, task):
                 await user_bot.forward_messages(entity=dest_id, messages=msg_id, from_peer=source_id)
             # Otherwise (header is OFF or it IS a poll), re-create the message
             else:
-                # FIX: Access poll question via message.media.poll.question
+                # FIX: Convert poll question and message text to string before checking
                 if original_message.media and hasattr(original_message.media, 'poll'):
-                    if '[REMEDICS]' in original_message.media.poll.question:
-                        original_message.media.poll.question = original_message.media.poll.question.replace('[REMEDICS]', '[MediX]')
+                    poll_question_str = str(original_message.media.poll.question)
+                    if '[REMEDICS]' in poll_question_str:
+                        original_message.media.poll.question = poll_question_str.replace('[REMEDICS]', '[MediX]')
                 
-                if original_message.text and '[REMEDICS]' in original_message.text:
-                    original_message.text = original_message.text.replace('[REMEDICS]', '[MediX]')
+                if original_message.text:
+                    message_text_str = str(original_message.text)
+                    if '[REMEDICS]' in message_text_str:
+                        original_message.text = message_text_str.replace('[REMEDICS]', '[MediX]')
 
                 await user_bot.send_message(dest_id, original_message)
 
@@ -416,7 +419,7 @@ async def main():
                 LOGGER.error(f"Failed to send startup notification: {e}")
 
         LOGGER.info("Starting worker...")
-        worker_task = asyncio.create_task(worker(user_bot, ptb_app))
+        worker_task = asyncio.create_task(worker(user_bot, bot_app))
         
         LOGGER.info("Application is now running. Waiting for commands.")
         await asyncio.Event().wait()
@@ -436,4 +439,3 @@ if __name__ == "__main__":
         LOGGER.info("Application stopped cleanly.")
     except Exception as e:
         LOGGER.critical(f"Application failed to run: {e}", exc_info=True)
-
