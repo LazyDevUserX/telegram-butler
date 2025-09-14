@@ -198,7 +198,7 @@ async def process_forward_task(task):
 
             # --- MAIN FORWARDING LOGIC ---
             if message.poll:
-                # --- NEW: Check if the poll is already a forward ---
+                # If the poll is already a forward, preserve the original header
                 if message.fwd_from:
                     logger.info(f"Message {msg_id} is a forwarded poll. Using native forward to preserve header.")
                     await user_client.forward_messages(dest_entity, message)
@@ -217,7 +217,7 @@ async def process_forward_task(task):
             logger.warning(f"Flood wait of {fwe.seconds} seconds.")
             await status_msg.edit(f"⏳ **Flood Wait:** Pausing for {fwe.seconds}s.")
             await asyncio.sleep(fwe.seconds)
-            # Re-add the current message to be processed again after the wait
+            # Re-process the same message after the wait
             message_ids.insert(i, msg_id) 
             continue
         except Exception as e:
@@ -276,7 +276,7 @@ async def help_handler(event):
     """
     await event.respond(help_text, link_preview=False)
 
-## --- FIXED & REFACTORED: Forward Command Handler ---
+## --- This is the handler for /forward and /force_forward ---
 @bot_client.on(events.NewMessage(pattern=r'/forward|/force_forward', from_users=OWNER_ID))
 @owner_only
 async def any_forward_command_handler(event):
@@ -288,11 +288,13 @@ async def any_forward_command_handler(event):
     start_id, end_id = None, None
 
     try:
-        if len(args) == 3: # Full URLs provided
+        # Full URLs provided: /forward <start_url> <end_url> <dest_url>
+        if len(args) == 3:
             source_entity, start_id = await parse_message_url(args[0])
             _, end_id = await parse_message_url(args[1])
             dest_entity, _ = await parse_message_url(args[2])
-        elif len(args) == 2 and state.default_source and state.default_dest: # Shorthand IDs
+        # Shorthand with message IDs: /forward <start_id> <end_id>
+        elif len(args) == 2 and state.default_source and state.default_dest:
             source_entity = await user_client.get_entity(state.default_source)
             dest_entity = await user_client.get_entity(state.default_dest)
             start_id, end_id = int(args[0]), int(args[1])
@@ -308,6 +310,10 @@ async def any_forward_command_handler(event):
 
     if not all([source_entity, dest_entity, start_id, end_id]):
         await event.respond("❌ Could not process inputs. Check your URLs or default settings."); return
+
+    if end_id < start_id:
+        await event.respond("❌ Error: The end message ID must be greater than the start message ID.")
+        return
 
     task = {
         'type': 'forward',
@@ -325,7 +331,7 @@ async def any_forward_command_handler(event):
     if not state.is_running_task:
         asyncio.create_task(worker())
 
-## --- FIXED: Set Default Source/Destination Handler ---
+## --- This is the handler for /set_source and /set_dest ---
 @bot_client.on(events.NewMessage(pattern=r'/set_source|/set_dest', from_users=OWNER_ID))
 @owner_only
 async def set_default_handler(event):
@@ -334,14 +340,21 @@ async def set_default_handler(event):
     
     try:
         entity_identifier = event.text.split(maxsplit=1)[1]
+        
+        # Try to parse as integer (for chat IDs like -100...)
+        try:
+            entity_identifier = int(entity_identifier)
+        except ValueError:
+            pass # It's a username, proceed as string
+
         entity = await user_client.get_entity(entity_identifier)
         
         if is_source:
             state.default_source = entity.id
-            await event.respond(f"✅ **Default source set to:** `{entity.title if hasattr(entity, 'title') else entity.first_name}`")
+            await event.respond(f"✅ **Default source set to:** `{getattr(entity, 'title', entity.first_name)}`")
         else:
             state.default_dest = entity.id
-            await event.respond(f"✅ **Default destination set to:** `{entity.title if hasattr(entity, 'title') else entity.first_name}`")
+            await event.respond(f"✅ **Default destination set to:** `{getattr(entity, 'title', entity.first_name)}`")
 
     except IndexError:
         await event.respond(f"**Usage:** `{command} <@username or chat_id>`")
@@ -392,14 +405,15 @@ async def set_delay_handler(event):
 async def filter_handler(event):
     args = event.text.split()[1:]
     if not args:
-        await event.respond("Usage: `/filter <type1> <type2>...`\nValid types: `photo`, `video`, `document`, `poll`.\nUse `/filters` to see current filters. Send the command with no types to clear all filters.")
+        state.filters.clear()
+        await event.respond("✅ **All content filters cleared.**")
         return
     
     valid_filters = {'photo', 'video', 'document', 'poll'}
     added = set(arg for arg in args if arg in valid_filters)
     state.filters.update(added)
     if not added and args:
-        await event.respond("No valid filter types provided.")
+        await event.respond("No valid filter types provided. Use `photo`, `video`, `document`, or `poll`.")
     else:
         await event.respond(f"✅ **Filters updated.** Current filters: `{', '.join(state.filters) or 'None'}`")
 
@@ -416,11 +430,15 @@ async def show_filters_handler(event):
 async def status_handler(event):
     source_name, dest_name = "Not Set", "Not Set"
     if state.default_source:
-        try: source_name = (await user_client.get_entity(state.default_source)).title
-        except: source_name = f"ID: {state.default_source}"
+        try: 
+            entity = await user_client.get_entity(state.default_source)
+            source_name = getattr(entity, 'title', entity.first_name)
+        except: source_name = f"ID: {state.default_source} (Inaccessible)"
     if state.default_dest:
-        try: dest_name = (await user_client.get_entity(state.default_dest)).title
-        except: dest_name = f"ID: {state.default_dest}"
+        try: 
+            entity = await user_client.get_entity(state.default_dest)
+            dest_name = getattr(entity, 'title', entity.first_name)
+        except: dest_name = f"ID: {state.default_dest} (Inaccessible)"
 
     status_text = f"""
     **📊 Bot Status & Configuration**
@@ -444,6 +462,7 @@ async def main():
     await user_client.start()
     me = await user_client.get_me()
     logger.info(f"User client started as {me.first_name}.")
+    await bot_client.send_message(OWNER_ID, "✅ **Bot is online and ready!**")
     logger.info("Bot is running...")
     await bot_client.run_until_disconnected()
 
