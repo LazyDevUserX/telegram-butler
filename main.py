@@ -6,7 +6,7 @@ import logging
 from collections import deque
 from datetime import datetime, timedelta
 
-from telethon import TelegramClient, events, types, utils ## --- IMPORT ADDED ---
+from telethon import TelegramClient, events, types
 from telethon.sessions import StringSession
 from telethon.errors import MessageIdInvalidError, FloodWaitError, ChatAdminRequiredError, rpcerrorlist
 from telethon.tl.types import PeerChannel
@@ -79,7 +79,7 @@ def format_progress_bar(progress, total, elapsed_time):
         eta = str(timedelta(seconds=int(eta_seconds)))
     return f"[{bar}] {progress}/{total} ({percentage:.2f}%)\n**ETA:** {eta}"
 
-## --- RE-INTRODUCED & FIXED: Poll Recreation Logic ---
+# --- Poll Recreation Logic ---
 async def _recreate_poll(message, destination_entity):
     """Builds and sends a new poll based on an existing one."""
     if not message.poll: return
@@ -99,7 +99,8 @@ async def _recreate_poll(message, destination_entity):
         destination_entity,
         file=types.InputMediaPoll(
             poll=types.Poll(
-                id=utils.get_random_id(), # Fixed the call to get_random_id
+                # --- BUG FIX: Removed the unstable id=utils.get_random_id() line ---
+                # Telegram will assign an ID automatically.
                 question=poll.question,
                 answers=[types.PollAnswer(ans.text, ans.option) for ans in poll.answers],
                 quiz=quiz,
@@ -178,17 +179,12 @@ async def process_forward_task(task):
                 i += 1
                 continue
 
-            ## --- UPDATED LOGIC: Smart header handling ---
             if state.forward_header:
-                # Standard forward with "Forwarded from" header
                 await user_client.forward_messages(dest_entity, message)
             else:
-                # Special handling for headerless forwarding
                 if message.poll:
-                    # Polls must be explicitly re-created
                     await _recreate_poll(message, dest_entity)
                 else:
-                    # Other types can be "copied" by sending the message object
                     await user_client.send_message(dest_entity, message)
             
             processed_count += 1
@@ -199,7 +195,7 @@ async def process_forward_task(task):
             continue
         except Exception as e:
             skipped.append(f"`{msg_id}`: Failed ({type(e).__name__})")
-            logger.error(f"Failed to process message {msg_id}: {e}", exc_info=True) # Log full traceback for this error
+            logger.error(f"Failed to process message {msg_id}: {e}", exc_info=True)
         
         if i % 5 == 0 or i == total_count - 1:
             elapsed = time.time() - start_time
@@ -277,7 +273,6 @@ async def process_delete_task(task):
     try: await status_msg.edit(summary)
     except MessageIdInvalidError: pass
 
-
 # --- Bot Command Handlers ---
 
 @bot_client.on(events.NewMessage(pattern='/start', from_users=OWNER_ID))
@@ -311,8 +306,6 @@ async def help_handler(event):
     `/filters` - Shows current content filters.
     """
     await event.respond(help_text, link_preview=False)
-
-# ... (All other handlers: /forward, /delete, /set_source, etc. remain unchanged) ...
 
 @bot_client.on(events.NewMessage(pattern=r'/forward', from_users=OWNER_ID))
 @owner_only
@@ -402,7 +395,6 @@ async def delete_command_handler(event):
     if not state.is_running_task:
         asyncio.create_task(worker())
 
-
 @bot_client.on(events.NewMessage(pattern=r'/set_source|/set_dest', from_users=OWNER_ID))
 @owner_only
 async def set_default_handler(event):
@@ -429,7 +421,6 @@ async def set_default_handler(event):
     except Exception as e:
         await event.respond(f"❌ **Error:** Could not find entity. `{e}`")
 
-
 @bot_client.on(events.NewMessage(pattern='/header', from_users=OWNER_ID))
 @owner_only
 async def header_handler(event):
@@ -446,7 +437,6 @@ async def header_handler(event):
     except IndexError:
         await event.respond(f"Header is currently **{'ON' if state.forward_header else 'OFF'}**.")
 
-
 @bot_client.on(events.NewMessage(pattern='/cancel', from_users=OWNER_ID))
 @owner_only
 async def cancel_handler(event):
@@ -456,7 +446,6 @@ async def cancel_handler(event):
     state.cancel_requested = True
     state.task_queue.clear()
     await event.respond("🛑 **Cancel request received!** The current task will stop, and the queue has been cleared.")
-
 
 @bot_client.on(events.NewMessage(pattern='/set_delay', from_users=OWNER_ID))
 @owner_only
@@ -470,7 +459,6 @@ async def set_delay_handler(event):
         await event.respond(f"✅ **Delay between batches set to {state.delay} seconds.**")
     except (IndexError, ValueError):
         await event.respond(f"Usage: `/set_delay <seconds>`. Current: `{state.delay}`s.")
-
 
 @bot_client.on(events.NewMessage(pattern='/filter', from_users=OWNER_ID))
 @owner_only
@@ -489,7 +477,6 @@ async def filter_handler(event):
     else:
         await event.respond(f"✅ **Filters updated.** Current filters: `{', '.join(state.filters) or 'None'}`")
 
-
 @bot_client.on(events.NewMessage(pattern='/filters', from_users=OWNER_ID))
 @owner_only
 async def show_filters_handler(event):
@@ -497,7 +484,6 @@ async def show_filters_handler(event):
         await event.respond("No content filters are active.")
     else:
         await event.respond(f"**Active Content Filters:**\n- `{'`\n- `'.join(state.filters)}`")
-
 
 @bot_client.on(events.NewMessage(pattern='/status', from_users=OWNER_ID))
 @owner_only
@@ -529,14 +515,13 @@ async def status_handler(event):
     """
     await event.respond(status_text)
 
-
 async def main():
     await bot_client.start(bot_token=BOT_TOKEN)
     logger.info("Bot client started.")
     await user_client.start()
     me = await user_client.get_me()
     logger.info(f"User client started as {me.first_name}.")
-    await bot_client.send_message(OWNER_ID, "✅ **Bot is online and ready!**")
+    await bot_client.send_message(OWNER_ID, "✅ **Bot is online and ready!** (v4 - Stable)")
     logger.info("Bot is running...")
     await bot_client.run_until_disconnected()
 
