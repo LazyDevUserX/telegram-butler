@@ -1,17 +1,18 @@
-# --- main.py v6.2 (Formatted Text Fix) ---
-# Fixes 'TextWithEntities' error by converting text to string before replacement.
+# --- main.py v7 (Unified Telethon Engine) ---
+# This is a major rewrite for stability and to fix poll forwarding.
+# It now uses only the Telethon library for both the user and bot clients.
 
 import os
 import asyncio
 import logging
 import time
+import json
 from flask import Flask
 from threading import Thread
-from telethon.sync import TelegramClient
+
+from telethon.sync import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors.rpcerrorlist import FloodWaitError, MessageIdInvalidError
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
 
 # --- Configuration ---
 API_ID = os.environ.get('API_ID')
@@ -20,12 +21,14 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN')
 SESSION_STRING = os.environ.get('SESSION_STRING')
 OWNER_ID = int(os.environ.get('OWNER_ID', 0))
 
-# --- In-Memory Settings Store ---
+# --- In-Memory Settings Store with a new section for replacement rules ---
 user_settings = {
     "source_chat": None,
     "dest_chat": None,
-    "forward_header": True, # Default to forwarding with header
-    "delay_seconds": 1     # Default delay of 1 second
+    "forward_header": True,
+    "delay_seconds": 1,
+    "replace_enabled": False, # Off by default as requested
+    "replace_rules": {}       # Stores "find": "replace" pairs
 }
 
 # --- Task Control ---
@@ -41,401 +44,348 @@ LOGGER = logging.getLogger(__name__)
 # --- Flask Web Server for Render Health Check ---
 app = Flask('')
 @app.route('/')
-def home():
-    return "I am awake!"
-
-def run_flask():
-    app.run(host='0.0.0.0', port=8080)
-
+def home(): return "I am awake!"
+def run_flask(): app.run(host='0.0.0.0', port=8080)
 def keep_alive():
     t = Thread(target=run_flask)
     t.start()
     LOGGER.info("Keep-alive server started.")
 
-# --- UI Helper Function ---
+# --- UI Helper ---
 def create_progress_bar(progress, total, length=20):
-    """Creates a text-based progress bar."""
     if total == 0: return '█' * length
     filled_length = int(length * progress // total)
-    bar = '█' * filled_length + '░' * (length - filled_length)
-    return bar
+    return '█' * filled_length + '░' * (length - filled_length)
 
-# --- Task Queue and Worker Setup ---
+# --- Task Queue and Worker ---
 task_queue = asyncio.Queue()
 
-async def worker(user_bot, bot_app):
-    LOGGER.info("Worker started, waiting for tasks.")
+async def worker(user_bot, bot_client):
+    LOGGER.info("Worker started.")
     while True:
         try:
-            # Reset cancel event for the new task
             cancel_event.clear()
-            
             task = await task_queue.get()
             task_type = task.get('type')
             
             if task_type == 'forward':
-                await handle_forward_task(user_bot, bot_app, task)
+                await handle_forward_task(user_bot, bot_client, task)
             elif task_type == 'delete':
-                await handle_delete_task(user_bot, bot_app, task)
+                await handle_delete_task(user_bot, bot_client, task)
             elif task_type == 'send':
-                await handle_send_task(user_bot, bot_app, task)
+                await user_bot.send_message(task['dest_id'], task['text'])
+                await bot_client.send_message(task['chat_id'], "✅ Message sent successfully.")
                 
         except Exception as e:
             LOGGER.error(f"Worker loop error: {e}", exc_info=True)
         finally:
-            if not task_queue.empty():
-                task_queue.task_done()
+            task_queue.task_done()
 
-async def handle_send_task(user_bot, bot_app, task):
-    """Handles sending a simple text message."""
-    try:
-        await user_bot.send_message(task['dest_id'], task['text'])
-        await bot_app.bot.send_message(task['chat_id'], "✅ Message sent successfully.")
-    except Exception as e:
-        LOGGER.error(f"Error sending message: {e}")
-        await bot_app.bot.send_message(task['chat_id'], f"❌ Error sending message: {e}")
+# --- Task Handlers ---
 
-async def handle_forward_task(user_bot, bot_app, task):
-    """Handles the forwarding task with progress updates and cancellation."""
+def apply_replacements(text):
+    """Applies all user-defined replacement rules to a string."""
+    for find, replace in user_settings["replace_rules"].items():
+        text = text.replace(find, replace)
+    return text
+
+async def handle_forward_task(user_bot, bot_client, task):
     chat_id, source_id, dest_id, start_id, end_id = [task[k] for k in ['chat_id', 'source_id', 'dest_id', 'start_id', 'end_id']]
     total_messages = (end_id - start_id) + 1
-    processed_count = 0
-    skipped_count = 0
+    processed, skipped = 0, 0
     
-    status_msg = await bot_app.bot.send_message(chat_id, "Starting forward task...")
-    last_update_time = time.time()
+    status_msg = await bot_client.send_message(chat_id, "Starting forward task...")
+    last_update = time.time()
 
     for msg_id in range(start_id, end_id + 1):
         if cancel_event.is_set():
-            LOGGER.info("Cancel event set. Breaking from forward loop.")
+            LOGGER.info("Cancellation detected.")
             break
-
         try:
-            original_message = await user_bot.get_messages(source_id, ids=msg_id)
-            if not original_message:
-                skipped_count += 1
+            message = await user_bot.get_messages(source_id, ids=msg_id)
+            if not message:
+                skipped += 1
                 continue
-
-            # If header is ON and it's NOT a poll, use the efficient forward_messages
-            if user_settings["forward_header"] and not original_message.poll:
-                await user_bot.forward_messages(entity=dest_id, messages=msg_id, from_peer=source_id)
-            # Otherwise (header is OFF or it IS a poll), re-create the message
+            
+            # THE CORE FIX: Inspired by your script
+            # If replacement is OFF, use the reliable direct forward method
+            if not user_settings["replace_enabled"]:
+                await message.forward_to(dest_id)
+            # If replacement is ON, we must rebuild the message
             else:
-                # FIX: Convert poll question and message text to string before checking
-                if original_message.media and hasattr(original_message.media, 'poll'):
-                    poll_question_str = str(original_message.media.poll.question)
-                    if '[REMEDICS]' in poll_question_str:
-                        original_message.media.poll.question = poll_question_str.replace('[REMEDICS]', '[MediX]')
+                new_text = message.text
+                if new_text:
+                    new_text = apply_replacements(str(new_text))
                 
-                if original_message.text:
-                    message_text_str = str(original_message.text)
-                    if '[REMEDICS]' in message_text_str:
-                        original_message.text = message_text_str.replace('[REMEDICS]', '[MediX]')
+                # Handle polls separately
+                if message.media and hasattr(message.media, 'poll'):
+                    poll_question = str(message.media.poll.question)
+                    poll_question = apply_replacements(poll_question)
+                    
+                    # We need to construct a new poll to send it
+                    await user_bot.send_message(
+                        dest_id,
+                        file=message.media,
+                        text=new_text
+                    )
+                else: # Handle regular messages
+                    await user_bot.send_message(
+                        dest_id,
+                        message=new_text or "",
+                        file=message.file or None
+                    )
 
-                await user_bot.send_message(dest_id, original_message)
-
-            processed_count += 1
-            await asyncio.sleep(user_settings["delay_seconds"]) # Use configured delay
+            processed += 1
+            await asyncio.sleep(user_settings["delay_seconds"])
         except FloodWaitError as e:
-            LOGGER.warning(f"Flood wait of {e.seconds}s. Pausing task.")
-            await bot_app.bot.edit_message_text(chat_id=chat_id, message_id=status_msg.message_id, text=f"⚠️ Flood wait. Pausing for {e.seconds} seconds...")
+            LOGGER.warning(f"Flood wait: {e.seconds}s.")
+            await status_msg.edit(text=f"⚠️ Flood wait. Pausing for {e.seconds}s...")
             await asyncio.sleep(e.seconds)
         except MessageIdInvalidError:
-            LOGGER.warning(f"Message ID {msg_id} is invalid or deleted. Skipping.")
-            skipped_count += 1
+            skipped += 1
         except Exception as e:
-            LOGGER.error(f"Error forwarding message {msg_id}: {e}")
-            skipped_count += 1
-
-        if time.time() - last_update_time > 2 or (processed_count + skipped_count) % 10 == 0:
-            progress = processed_count + skipped_count
+            LOGGER.error(f"Error on msg {msg_id}: {e}")
+            skipped += 1
+            
+        # UI Update
+        if time.time() - last_update > 2:
+            progress = processed + skipped
             bar = create_progress_bar(progress, total_messages)
-            text = (f"**Forwarding in Progress...**\n\n"
-                    f"`{bar}`\n\n"
-                    f"**Processed:** {processed_count}/{total_messages}\n"
-                    f"**Skipped:** {skipped_count}\n"
-                    f"**Task:** `Forwarding`")
-            try:
-                await bot_app.bot.edit_message_text(chat_id=chat_id, message_id=status_msg.message_id, text=text, parse_mode='Markdown')
-                last_update_time = time.time()
-            except Exception: pass
-    
-    if cancel_event.is_set():
-        final_text = (f"**Task Cancelled!**\n\n"
-                      f"**Forwarded:** {processed_count} messages.\n"
-                      f"**Skipped:** {skipped_count} messages.")
-    else:
-        final_text = (f"**Task Completed!**\n\n"
-                      f"**Forwarded:** {processed_count} messages.\n"
-                      f"**Skipped:** {skipped_count} messages.")
-    await bot_app.bot.edit_message_text(chat_id=chat_id, message_id=status_msg.message_id, text=final_text, parse_mode='Markdown')
+            text = (f"**Forwarding...**\n`{bar}`\n"
+                    f"**Processed:** {processed}/{total_messages}\n"
+                    f"**Skipped:** {skipped}")
+            await status_msg.edit(text)
+            last_update = time.time()
 
+    final_text_verb = "Cancelled" if cancel_event.is_set() else "Completed"
+    final_text = (f"**Task {final_text_verb}!**\n"
+                  f"**Forwarded:** {processed}\n"
+                  f"**Skipped:** {skipped}")
+    await status_msg.edit(final_text)
 
-async def handle_delete_task(user_bot, bot_app, task):
-    """Handles the deletion task with progress updates and cancellation."""
+async def handle_delete_task(user_bot, bot_client, task):
+    # This function remains largely the same logic
     chat_id, dest_id, start_id, end_id = [task[k] for k in ['chat_id', 'dest_id', 'start_id', 'end_id']]
-    total_messages = (end_id - start_id) + 1
+    total = (end_id - start_id) + 1
     deleted_count = 0
     
-    status_msg = await bot_app.bot.send_message(chat_id, "Starting delete task...")
-    last_update_time = time.time()
+    status_msg = await bot_client.send_message(chat_id, "Starting delete task...")
+    last_update = time.time()
 
-    message_ids_to_delete = list(range(start_id, end_id + 1))
+    msg_ids = list(range(start_id, end_id + 1))
     
-    for i in range(0, len(message_ids_to_delete), 100):
-        if cancel_event.is_set():
-            LOGGER.info("Cancel event set. Breaking from delete loop.")
-            break
-        
-        chunk = message_ids_to_delete[i:i+100]
+    for i in range(0, len(msg_ids), 100):
+        if cancel_event.is_set(): break
+        chunk = msg_ids[i:i+100]
         try:
             await user_bot.delete_messages(entity=dest_id, message_ids=chunk)
             deleted_count += len(chunk)
             await asyncio.sleep(1)
-        except FloodWaitError as e:
-            LOGGER.warning(f"Flood wait of {e.seconds}s on delete. Pausing task.")
-            await bot_app.bot.edit_message_text(chat_id=chat_id, message_id=status_msg.message_id, text=f"⚠️ Flood wait. Pausing for {e.seconds} seconds...")
-            await asyncio.sleep(e.seconds)
-        except Exception as e:
-            LOGGER.error(f"Error deleting chunk: {e}")
+        except Exception as e: LOGGER.error(f"Error deleting chunk: {e}")
             
-        if time.time() - last_update_time > 2:
-            bar = create_progress_bar(deleted_count, total_messages)
-            text = (f"**Deletion in Progress...**\n\n"
-                    f"`{bar}`\n\n"
-                    f"**Deleted:** {deleted_count}/{total_messages}\n"
-                    f"**Task:** `Deleting`")
-            try:
-                await bot_app.bot.edit_message_text(chat_id=chat_id, message_id=status_msg.message_id, text=text, parse_mode='Markdown')
-                last_update_time = time.time()
-            except Exception: pass
+        if time.time() - last_update > 2:
+            bar = create_progress_bar(deleted_count, total)
+            text = f"**Deleting...**\n`{bar}`\n**Deleted:** {deleted_count}/{total}"
+            await status_msg.edit(text)
+            last_update = time.time()
 
-    if cancel_event.is_set():
-        final_text = f"**Task Cancelled!**\n\n**Deleted:** {deleted_count} messages."
-    else:
-        final_text = f"**Task Completed!**\n\n**Deleted:** {deleted_count} messages."
-    await bot_app.bot.edit_message_text(chat_id=chat_id, message_id=status_msg.message_id, text=final_text, parse_mode='Markdown')
+    final_verb = "Cancelled" if cancel_event.is_set() else "Completed"
+    final_text = f"**Task {final_verb}!**\n**Deleted:** {deleted_count} messages."
+    await status_msg.edit(final_text)
 
+# --- Main Bot Client and Command Handlers (All Telethon now) ---
+user_bot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+bot = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# --- Telegram Bot (Controller) Command Handlers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Butler is online. Use /help to see available commands.")
+@bot.on(events.NewMessage(pattern='/start', from_users=OWNER_ID))
+async def start_handler(event):
+    await event.respond("Butler is online. Use /help to see available commands.")
 
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_bot_client = context.bot_data['user_bot']
+@bot.on(events.NewMessage(pattern='/ping', from_users=OWNER_ID))
+async def ping_handler(event):
+    await user_bot.send_message("me", "Pong!")
+    await event.respond("Pong! Check your \"Saved Messages\".")
+
+@bot.on(events.NewMessage(pattern='/forward', from_users=OWNER_ID))
+async def forward_handler(event):
+    parts = event.raw_text.split()
+    source, dest = user_settings["source_chat"], user_settings["dest_chat"]
+    
     try:
-        await user_bot_client.send_message("me", "Pong!")
-        await update.message.reply_text("Pong! Check your \"Saved Messages\".")
-    except Exception as e:
-        await update.message.reply_text(f"Error pinging User-Bot: {e}")
-
-async def forward_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        parts = update.message.text.split()
-        source_id = user_settings["source_chat"]
-        dest_id = user_settings["dest_chat"]
-        start_id, end_id = None, None
-
         if len(parts) == 3:
-            start_id, end_id = int(parts[1]), int(parts[2])
-            if not source_id or not dest_id:
-                await update.message.reply_text("Please set source and destination chats first using /set.")
+            start, end = int(parts[1]), int(parts[2])
+            if not all([source, dest]):
+                await event.respond("Source/Destination not set. Use `/set`.")
                 return
         elif len(parts) == 5:
-            source_id, dest_id, start_id, end_id = map(int, parts[1:])
+            source, dest, start, end = map(int, parts[1:])
         else:
-            await update.message.reply_text("Usage:\n`/forward <start> <end>`\n`/forward <source> <dest> <start> <end>`", parse_mode='Markdown')
+            await event.respond("Usage:\n`/forward <start> <end>`\n`/forward <src> <dest> <start> <end>`")
             return
-
-        task = {'type': 'forward', 'chat_id': update.effective_chat.id, 'source_id': source_id, 'dest_id': dest_id, 'start_id': start_id, 'end_id': end_id}
-        if task['start_id'] > task['end_id']:
-            await update.message.reply_text("Error: Start ID must be less than or equal to end ID.")
-            return
-        await task_queue.put(task)
-        await update.message.reply_text("✅ Forward task added to the queue.")
-    except (ValueError, IndexError):
-        await update.message.reply_text("Invalid input. Please ensure all IDs are integers.")
-    except Exception as e:
-        await update.message.reply_text(f"An error occurred: {e}")
-
-async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        parts = update.message.text.split()
-        if len(parts) != 4:
-            await update.message.reply_text("Usage: /delete <channel_id> <start> <end>")
-            return
-        task = {'type': 'delete', 'chat_id': update.effective_chat.id, 'dest_id': int(parts[1]), 'start_id': int(parts[2]), 'end_id': int(parts[3])}
-        if task['start_id'] > task['end_id']:
-            await update.message.reply_text("Error: Start ID must be less than or equal to end ID.")
-            return
-        await task_queue.put(task)
-        await update.message.reply_text("✅ Delete task added to the queue.")
-    except (ValueError, IndexError):
-        await update.message.reply_text("Invalid input. Please ensure all IDs are integers.")
-    except Exception as e:
-        await update.message.reply_text(f"An error occurred: {e}")
         
-async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        parts = update.message.text.split(maxsplit=2)
-        if len(parts) < 3:
-            await update.message.reply_text("Usage: /send <channel_id> <message_text>")
-            return
-        task = {'type': 'send', 'chat_id': update.effective_chat.id, 'dest_id': int(parts[1]), 'text': parts[2]}
+        task = {'type': 'forward', 'chat_id': event.chat_id, 'source_id': source, 'dest_id': dest, 'start_id': start, 'end_id': end}
         await task_queue.put(task)
-        await update.message.reply_text("✅ Send task added to the queue.")
+        await event.respond("✅ Forward task added to queue.")
     except (ValueError, IndexError):
-        await update.message.reply_text("Invalid input. Channel ID must be an integer.")
-    except Exception as e:
-        await update.message.reply_text(f"An error occurred: {e}")
+        await event.respond("Invalid command format. IDs must be numbers.")
 
-async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@bot.on(events.NewMessage(pattern='/delete', from_users=OWNER_ID))
+async def delete_handler(event):
     try:
-        parts = update.message.text.split()
-        if len(parts) != 3:
-            await update.message.reply_text("Usage: /set <source|dest> <chat_id>")
-            return
-        setting_type, chat_id = parts[1].lower(), int(parts[2])
-        if setting_type == "source": user_settings["source_chat"] = chat_id
-        elif setting_type == "dest": user_settings["dest_chat"] = chat_id
-        else:
-            await update.message.reply_text("Invalid setting. Use 'source' or 'dest'.")
-            return
-        await update.message.reply_text(f"✅ Default {setting_type} chat set to: `{chat_id}`", parse_mode='Markdown')
+        _, dest, start, end = map(int, event.raw_text.split())
+        task = {'type': 'delete', 'chat_id': event.chat_id, 'dest_id': dest, 'start_id': start, 'end_id': end}
+        await task_queue.put(task)
+        await event.respond("✅ Delete task added to queue.")
     except (ValueError, IndexError):
-        await update.message.reply_text("Invalid command format or Chat ID.")
+        await event.respond("Usage: `/delete <chat_id> <start_id> <end_id>`")
 
-async def header_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@bot.on(events.NewMessage(pattern='/send', from_users=OWNER_ID))
+async def send_handler(event):
     try:
-        status = update.message.text.split()[1].lower()
-        if status == "on":
-            user_settings["forward_header"] = True
-            await update.message.reply_text("✅ Forwarding with header is now **ON**.", parse_mode='Markdown')
-        elif status == "off":
-            user_settings["forward_header"] = False
-            await update.message.reply_text("✅ Forwarding with header is now **OFF** (anonymous).", parse_mode='Markdown')
+        parts = event.raw_text.split(maxsplit=2)
+        dest, text = int(parts[1]), parts[2]
+        task = {'type': 'send', 'chat_id': event.chat_id, 'dest_id': dest, 'text': text}
+        await task_queue.put(task)
+        await event.respond("✅ Send task added to queue.")
+    except (ValueError, IndexError):
+        await event.respond("Usage: `/send <chat_id> <message>`")
+
+@bot.on(events.NewMessage(pattern='/set', from_users=OWNER_ID))
+async def set_handler(event):
+    try:
+        _, key, value = event.raw_text.split()
+        key = key.lower()
+        if key in ["source", "dest"]:
+            user_settings[f"{key}_chat"] = int(value)
+            await event.respond(f"✅ Default {key} chat set to `{value}`.")
         else:
-            await update.message.reply_text("Invalid status. Use 'on' or 'off'.")
+            await event.respond("Invalid key. Use `source` or `dest`.")
+    except (ValueError, IndexError):
+        await event.respond("Usage: `/set <source|dest> <chat_id>`")
+
+@bot.on(events.NewMessage(pattern='/header', from_users=OWNER_ID))
+async def header_handler(event):
+    try:
+        status = event.raw_text.split()[1].lower()
+        if status == "on": user_settings["forward_header"] = True
+        elif status == "off": user_settings["forward_header"] = False
+        else:
+            await event.respond("Use `on` or `off`.")
+            return
+        await event.respond(f"✅ Forwarding with header is now **{status.upper()}**.")
     except IndexError:
-        await update.message.reply_text("Usage: /header <on|off>")
+        await event.respond("Usage: `/header <on|off>`")
 
-async def delay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@bot.on(events.NewMessage(pattern='/delay', from_users=OWNER_ID))
+async def delay_handler(event):
     try:
-        delay = float(update.message.text.split()[1])
-        if 0 <= delay <= 60:
-            user_settings["delay_seconds"] = delay
-            await update.message.reply_text(f"✅ Delay between messages set to **{delay}** seconds.", parse_mode='Markdown')
-        else:
-            await update.message.reply_text("Please choose a delay between 0 and 60 seconds.")
+        delay = float(event.raw_text.split()[1])
+        user_settings["delay_seconds"] = delay
+        await event.respond(f"✅ Message delay set to `{delay}` seconds.")
     except (ValueError, IndexError):
-        await update.message.reply_text("Invalid delay. Please enter a number.")
+        await event.respond("Usage: `/delay <seconds>`")
 
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    source = user_settings['source_chat'] or 'Not Set'
-    dest = user_settings['dest_chat'] or 'Not Set'
-    header = "On" if user_settings['forward_header'] else "Off"
-    delay = user_settings['delay_seconds']
-    text = (f"**Current Butler Settings**\n\n"
-            f"**Default Source:** `{source}`\n"
-            f"**Default Destination:** `{dest}`\n"
-            f"**Forward with Header:** `{header}`\n"
-            f"**Message Delay:** `{delay}s`")
-    await update.message.reply_text(text, parse_mode='Markdown')
+# --- New Replace Commands ---
+@bot.on(events.NewMessage(pattern='/replace', from_users=OWNER_ID))
+async def replace_toggle_handler(event):
+    try:
+        status = event.raw_text.split()[1].lower()
+        if status == "on": user_settings["replace_enabled"] = True
+        elif status == "off": user_settings["replace_enabled"] = False
+        else:
+            await event.respond("Use `on` or `off`.")
+            return
+        await event.respond(f"✅ Text replacement is now **{status.upper()}**.")
+    except IndexError:
+        await event.respond("Usage: `/replace <on|off>`")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@bot.on(events.NewMessage(pattern='/add_replace', from_users=OWNER_ID))
+async def add_replace_handler(event):
+    try:
+        # Using json to parse arguments allows for spaces
+        args_json = event.raw_text.split(maxsplit=1)[1]
+        args = json.loads(args_json)
+        if len(args) != 2: raise ValueError
+        find_text, replace_text = args[0], args[1]
+        user_settings["replace_rules"][find_text] = replace_text
+        await event.respond(f"✅ Replacement rule added:\n`{find_text}` -> `{replace_text}`")
+    except Exception:
+        await event.respond('Usage: `/add_replace ["find text", "replace text"]`\n(Note: Use double quotes)')
+
+@bot.on(events.NewMessage(pattern='/clear_replace', from_users=OWNER_ID))
+async def clear_replace_handler(event):
+    user_settings["replace_rules"].clear()
+    await event.respond("✅ All replacement rules have been cleared.")
+
+@bot.on(events.NewMessage(pattern='/settings', from_users=OWNER_ID))
+async def settings_handler(event):
+    rules = "\n".join([f"`{k}` -> `{v}`" for k, v in user_settings['replace_rules'].items()]) or "`None`"
+    text = (
+        "**Current Butler Settings**\n\n"
+        f"**Source:** `{user_settings['source_chat'] or 'Not Set'}`\n"
+        f"**Destination:** `{user_settings['dest_chat'] or 'Not Set'}`\n"
+        f"**Header:** `{ 'On' if user_settings['forward_header'] else 'Off'}`\n"
+        f"**Delay:** `{user_settings['delay_seconds']}s`\n"
+        f"**Replacement:** `{'On' if user_settings['replace_enabled'] else 'Off'}`\n"
+        f"**Rules:**\n{rules}"
+    )
+    await event.respond(text)
+
+@bot.on(events.NewMessage(pattern='/help', from_users=OWNER_ID))
+async def help_handler(event):
     text = (
         "**Telegram Butler Help**\n\n"
-        "**Core Commands:**\n"
-        "`/forward <start> <end>`\n_› Forwards using saved chats._\n\n"
-        "`/forward <src> <dest> <start> <end>`\n_› Forwards using specified chats._\n\n"
-        "`/delete <chat_id> <start> <end>`\n_› Deletes messages in a range._\n\n"
-        "`/send <chat_id> <text>`\n_› Sends a message to a chat._\n\n"
+        "**Core:**\n"
+        "`/forward <start> <end>`\n"
+        "`/forward <src> <dest> <start> <end>`\n"
+        "`/delete <chat> <start> <end>`\n"
+        "`/send <chat> <text>`\n\n"
         "**Configuration:**\n"
-        "`/set <source|dest> <chat_id>`\n_› Saves default source or destination._\n\n"
-        "`/header <on|off>`\n_› Toggle forwarding with sender name._\n\n"
-        "`/delay <seconds>`\n_› Set delay between forwards._\n\n"
+        "`/set <source|dest> <chat_id>`\n"
+        "`/header <on|off>`\n"
+        "`/delay <seconds>`\n\n"
+        "**Text Replacement:**\n"
+        "`/replace <on|off>` (Default: off)\n"
+        '`/add_replace ["find", "new"]`\n'
+        "`/clear_replace`\n\n"
         "**Utilities:**\n"
-        "`/cancel`\n_› Stops the current task._\n\n"
-        "`/settings`\n_› Shows current settings._\n\n"
-        "`/ping`\n_› Checks if the user-bot is alive._"
+        "`/cancel` | `/settings` | `/ping`"
     )
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await event.respond(text)
 
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancels the current task and clears the queue."""
+@bot.on(events.NewMessage(pattern='/cancel', from_users=OWNER_ID))
+async def cancel_handler(event):
     if task_queue.empty():
-        await update.message.reply_text("No active task to cancel.")
+        await event.respond("No active task to cancel.")
         return
-        
     cancel_event.set()
-    
-    # Clear any pending tasks in the queue
     while not task_queue.empty():
         try:
             task_queue.get_nowait()
             task_queue.task_done()
-        except asyncio.QueueEmpty:
-            break
-            
-    await update.message.reply_text("🛑 Task cancellation requested. The current operation will stop shortly.")
+        except asyncio.QueueEmpty: break
+    await event.respond("🛑 Cancellation requested. Current task will stop, queue cleared.")
 
 
-# --- Main Application Logic ---
+# --- Main Application Start ---
 async def main():
-    LOGGER.info("Setting up Controller Bot...")
-    ptb_app = Application.builder().token(BOT_TOKEN).build()
-
-    LOGGER.info("Starting User-Bot client...")
-    user_bot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await user_bot.start()
-    LOGGER.info("User-Bot client started successfully.")
-
-    ptb_app.bot_data['user_bot'] = user_bot
-
-    LOGGER.info("Registering command handlers...")
-    ptb_app.add_handler(CommandHandler("start", start))
-    ptb_app.add_handler(CommandHandler("ping", ping))
-    ptb_app.add_handler(CommandHandler("forward", forward_command))
-    ptb_app.add_handler(CommandHandler("delete", delete_command))
-    ptb_app.add_handler(CommandHandler("send", send_command))
-    ptb_app.add_handler(CommandHandler("set", set_command))
-    ptb_app.add_handler(CommandHandler("header", header_command))
-    ptb_app.add_handler(CommandHandler("delay", delay_command))
-    ptb_app.add_handler(CommandHandler("settings", settings_command))
-    ptb_app.add_handler(CommandHandler("help", help_command))
-    ptb_app.add_handler(CommandHandler("cancel", cancel_command)) # New
-    LOGGER.info("Command handlers registered.")
+    LOGGER.info("User-Bot client started.")
     
-    async with ptb_app:
-        LOGGER.info("Starting controller bot polling...")
-        await ptb_app.start()
-        await ptb_app.updater.start_polling()
-        
-        if OWNER_ID:
-            try:
-                await ptb_app.bot.send_message(chat_id=OWNER_ID, text="✅ Butler is updated and online!")
-                LOGGER.info(f"Sent startup notification to OWNER_ID: {OWNER_ID}")
-            except Exception as e:
-                LOGGER.error(f"Failed to send startup notification: {e}")
+    # Start the worker task
+    asyncio.create_task(worker(user_bot, bot))
+    
+    # Send startup message
+    if OWNER_ID:
+        await bot.send_message(OWNER_ID, "✅ Butler is updated and online!")
+    
+    LOGGER.info("Application is now running.")
+    await bot.run_until_disconnected()
 
-        LOGGER.info("Starting worker...")
-        worker_task = asyncio.create_task(worker(user_bot, bot_app))
-        
-        LOGGER.info("Application is now running. Waiting for commands.")
-        await asyncio.Event().wait()
-        
-        LOGGER.info("Shutting down...")
-        await ptb_app.updater.stop()
-        await ptb_app.stop()
-        worker_task.cancel()
-        await user_bot.disconnect()
 
 if __name__ == "__main__":
     keep_alive()
     LOGGER.info("Application starting...")
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        LOGGER.info("Application stopped cleanly.")
-    except Exception as e:
-        LOGGER.critical(f"Application failed to run: {e}", exc_info=True)
+    # Telethon's event loop management is more direct
+    user_bot.loop.run_until_complete(main())
+
