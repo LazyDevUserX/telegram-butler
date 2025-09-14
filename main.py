@@ -6,7 +6,7 @@ import logging
 from collections import deque
 from datetime import datetime, timedelta
 
-from telethon import TelegramClient, events, types
+from telethon import TelegramClient, events, types, utils ## --- IMPORT ADDED ---
 from telethon.sessions import StringSession
 from telethon.errors import MessageIdInvalidError, FloodWaitError, ChatAdminRequiredError, rpcerrorlist
 from telethon.tl.types import PeerChannel
@@ -28,7 +28,7 @@ class BotState:
         self.task_queue = deque()
         self.is_running_task = False
         self.cancel_requested = False
-        self.delay = 1.0 # Delay between batches/chunks
+        self.delay = 1.0
         self.filters = set()
         self.default_source = None
         self.default_dest = None
@@ -79,6 +79,38 @@ def format_progress_bar(progress, total, elapsed_time):
         eta = str(timedelta(seconds=int(eta_seconds)))
     return f"[{bar}] {progress}/{total} ({percentage:.2f}%)\n**ETA:** {eta}"
 
+## --- RE-INTRODUCED & FIXED: Poll Recreation Logic ---
+async def _recreate_poll(message, destination_entity):
+    """Builds and sends a new poll based on an existing one."""
+    if not message.poll: return
+    
+    poll = message.poll.poll
+    quiz = poll.quiz
+    correct_answers_data = []
+    solution, solution_entities = None, None
+
+    if quiz and message.media and hasattr(message.media, 'results') and message.media.results:
+        solution = message.media.results.solution
+        solution_entities = message.media.results.solution_entities
+        if message.media.results.results:
+             correct_answers_data = [res.option for res in message.media.results.results if res.correct]
+
+    await user_client.send_message(
+        destination_entity,
+        file=types.InputMediaPoll(
+            poll=types.Poll(
+                id=utils.get_random_id(), # Fixed the call to get_random_id
+                question=poll.question,
+                answers=[types.PollAnswer(ans.text, ans.option) for ans in poll.answers],
+                quiz=quiz,
+            ),
+            correct_answers=correct_answers_data if correct_answers_data else None,
+            solution=solution,
+            solution_entities=solution_entities
+        )
+    )
+    logger.info(f"Successfully re-created poll from message {message.id}.")
+
 # --- Core Task Processing Logic ---
 async def worker():
     if state.is_running_task: return
@@ -92,7 +124,6 @@ async def worker():
         try:
             if task['type'] == 'forward':
                 await process_forward_task(task)
-            # --- NEW: Handle delete task type ---
             elif task['type'] == 'delete':
                 await process_delete_task(task)
         except Exception as e:
@@ -147,10 +178,18 @@ async def process_forward_task(task):
                 i += 1
                 continue
 
+            ## --- UPDATED LOGIC: Smart header handling ---
             if state.forward_header:
+                # Standard forward with "Forwarded from" header
                 await user_client.forward_messages(dest_entity, message)
             else:
-                await user_client.send_message(dest_entity, message)
+                # Special handling for headerless forwarding
+                if message.poll:
+                    # Polls must be explicitly re-created
+                    await _recreate_poll(message, dest_entity)
+                else:
+                    # Other types can be "copied" by sending the message object
+                    await user_client.send_message(dest_entity, message)
             
             processed_count += 1
         except FloodWaitError as fwe:
@@ -160,7 +199,7 @@ async def process_forward_task(task):
             continue
         except Exception as e:
             skipped.append(f"`{msg_id}`: Failed ({type(e).__name__})")
-            logger.error(f"Failed to process message {msg_id}: {e}", exc_info=False)
+            logger.error(f"Failed to process message {msg_id}: {e}", exc_info=True) # Log full traceback for this error
         
         if i % 5 == 0 or i == total_count - 1:
             elapsed = time.time() - start_time
@@ -169,7 +208,6 @@ async def process_forward_task(task):
             except MessageIdInvalidError:
                 break
         
-        # Individual message delay for forwarding is often shorter
         await asyncio.sleep(0.5) 
         i += 1
 
@@ -181,7 +219,6 @@ async def process_forward_task(task):
     try: await status_msg.edit(summary)
     except MessageIdInvalidError: pass
 
-# --- NEW: Delete Task Processor ---
 async def process_delete_task(task):
     chat_id = task['chat_id']
     status_msg = await bot_client.send_message(chat_id, "🚀 Starting delete task...")
@@ -198,7 +235,7 @@ async def process_delete_task(task):
     total_count = len(all_message_ids)
     deleted_count = 0
     start_time = time.time()
-    CHUNK_SIZE = 100 # Telegram API limit
+    CHUNK_SIZE = 100
 
     for i in range(0, total_count, CHUNK_SIZE):
         if state.cancel_requested:
@@ -210,19 +247,18 @@ async def process_delete_task(task):
             await user_client.delete_messages(target_entity, chunk)
             deleted_count += len(chunk)
         except ChatAdminRequiredError:
-            await status_msg.edit("❌ **Deletion Failed!**\nReason: Admin permissions are required to delete messages in this chat.")
+            await status_msg.edit("❌ **Deletion Failed!**\nReason: Admin permissions are required.")
             return
         except FloodWaitError as fwe:
             logger.warning(f"Flood wait of {fwe.seconds} seconds during deletion.")
             await status_msg.edit(f"⏳ **Flood Wait:** Pausing for {fwe.seconds}s.")
             await asyncio.sleep(fwe.seconds)
-            # Re-process the same chunk
             try:
                 await user_client.delete_messages(target_entity, chunk)
                 deleted_count += len(chunk)
             except Exception as e:
                 logger.error(f"Failed to delete chunk after flood wait: {e}")
-                await status_msg.edit(f"🚨 **Error after Flood Wait!**\nCould not delete messages. Task aborted. Reason: `{e}`")
+                await status_msg.edit(f"🚨 **Error after Flood Wait!** Task aborted. Reason: `{e}`")
                 return
         except Exception as e:
             logger.error(f"An error occurred during deletion: {e}")
@@ -235,7 +271,7 @@ async def process_delete_task(task):
         except MessageIdInvalidError:
             break
         
-        await asyncio.sleep(state.delay) # Delay between chunks
+        await asyncio.sleep(state.delay)
 
     summary = f"✅ **Deletion Complete!**\n\n**Deleted:** {deleted_count}/{total_count} messages."
     try: await status_msg.edit(summary)
@@ -251,7 +287,6 @@ async def start_handler(event):
 @bot_client.on(events.NewMessage(pattern='/help', from_users=OWNER_ID))
 @owner_only
 async def help_handler(event):
-    # --- UPDATED: Help text with /delete command ---
     help_text = """
     **🤖 Userbot Command Center**
 
@@ -276,6 +311,8 @@ async def help_handler(event):
     `/filters` - Shows current content filters.
     """
     await event.respond(help_text, link_preview=False)
+
+# ... (All other handlers: /forward, /delete, /set_source, etc. remain unchanged) ...
 
 @bot_client.on(events.NewMessage(pattern=r'/forward', from_users=OWNER_ID))
 @owner_only
@@ -324,7 +361,6 @@ async def forward_command_handler(event):
     if not state.is_running_task:
         asyncio.create_task(worker())
 
-# --- NEW: Delete Command Handler ---
 @bot_client.on(events.NewMessage(pattern=r'/delete', from_users=OWNER_ID))
 @owner_only
 async def delete_command_handler(event):
