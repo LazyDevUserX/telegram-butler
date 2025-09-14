@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
-from telethon.errors import MessageIdInvalidError, FloodWaitError, UserIsAdminInChatError, ChatAdminRequiredError
+from telethon.errors import MessageIdInvalidError, FloodWaitError, ChatAdminRequiredError
 
 # --- Configuration ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
