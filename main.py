@@ -136,14 +136,15 @@ async def process_forward_task(task):
             if message.poll:
                 poll = message.poll.poll
                 quiz = poll.quiz
-                correct_answers_data = None
+                
+                # --- FINAL FIX IS HERE ---
+                # Initialize with an empty list instead of None to prevent TypeError
+                correct_answers_data = [] 
                 solution, solution_entities = None, None
 
                 if quiz and message.media and hasattr(message.media, 'results') and message.media.results:
                     solution = message.media.results.solution
                     solution_entities = message.media.results.solution_entities
-                    # --- CRITICAL FIX IS HERE ---
-                    # The API expects a list of byte strings, not integers.
                     correct_answers_data = [res.option for res in message.media.results.results if res.correct]
                 
                 await user_client.send_message(
@@ -170,7 +171,6 @@ async def process_forward_task(task):
         except FloodWaitError as fwe:
             await status_msg.edit(f"⏳ **Flood Wait:** Pausing for {fwe.seconds}s."); await asyncio.sleep(fwe.seconds); continue
         except Exception as e:
-            # Add more detailed error logging
             skipped.append(f"`{msg_id}`: Failed ({type(e).__name__}: {e})")
         
         if i % 5 == 0 or i == total_count - 1:
