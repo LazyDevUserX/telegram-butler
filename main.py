@@ -28,7 +28,7 @@ class BotState:
         self.task_queue = deque()
         self.is_running_task = False
         self.cancel_requested = False
-        self.delay = 1.0
+        self.delay = 1.0 # Delay between batches/chunks
         self.filters = set()
         self.default_source = None
         self.default_dest = None
@@ -90,7 +90,11 @@ async def worker():
         
         task = state.task_queue.popleft()
         try:
-            if task['type'] == 'forward': await process_forward_task(task)
+            if task['type'] == 'forward':
+                await process_forward_task(task)
+            # --- NEW: Handle delete task type ---
+            elif task['type'] == 'delete':
+                await process_delete_task(task)
         except Exception as e:
             logger.error(f"Worker failed on task {task}: {e}", exc_info=True)
             try: await bot_client.send_message(task['chat_id'], f"🚨 **Task Failed!**\n**Reason:** `{e}`")
@@ -110,7 +114,7 @@ async def process_forward_task(task):
         start_id = task['start_id']
         end_id = task['end_id']
     except Exception as e:
-        await status_msg.edit(f"❌ **Error:** Could not find one of the channels/chats. Please check your settings. Details: `{e}`")
+        await status_msg.edit(f"❌ **Error:** Could not find one of the channels/chats. Details: `{e}`")
         return
 
     skipped, processed_count = [], 0
@@ -143,12 +147,9 @@ async def process_forward_task(task):
                 i += 1
                 continue
 
-            # --- SIMPLIFIED FORWARDING LOGIC ---
             if state.forward_header:
-                # Standard forward with "Forwarded from" header
                 await user_client.forward_messages(dest_entity, message)
             else:
-                # Copies the message content without the header. Works for all types.
                 await user_client.send_message(dest_entity, message)
             
             processed_count += 1
@@ -168,7 +169,8 @@ async def process_forward_task(task):
             except MessageIdInvalidError:
                 break
         
-        await asyncio.sleep(state.delay)
+        # Individual message delay for forwarding is often shorter
+        await asyncio.sleep(0.5) 
         i += 1
 
     summary = f"✅ **Forwarding Complete!**\n\n**Processed:** {processed_count}/{total_count} messages."
@@ -179,6 +181,67 @@ async def process_forward_task(task):
     try: await status_msg.edit(summary)
     except MessageIdInvalidError: pass
 
+# --- NEW: Delete Task Processor ---
+async def process_delete_task(task):
+    chat_id = task['chat_id']
+    status_msg = await bot_client.send_message(chat_id, "🚀 Starting delete task...")
+
+    try:
+        target_entity = await user_client.get_entity(task['target_id'])
+        start_id = task['start_id']
+        end_id = task['end_id']
+    except Exception as e:
+        await status_msg.edit(f"❌ **Error:** Could not find the target channel. Details: `{e}`")
+        return
+        
+    all_message_ids = list(range(start_id, end_id + 1))
+    total_count = len(all_message_ids)
+    deleted_count = 0
+    start_time = time.time()
+    CHUNK_SIZE = 100 # Telegram API limit
+
+    for i in range(0, total_count, CHUNK_SIZE):
+        if state.cancel_requested:
+            await status_msg.edit("🛑 **Task Canceled by User!**"); return
+            
+        chunk = all_message_ids[i:i + CHUNK_SIZE]
+        
+        try:
+            await user_client.delete_messages(target_entity, chunk)
+            deleted_count += len(chunk)
+        except ChatAdminRequiredError:
+            await status_msg.edit("❌ **Deletion Failed!**\nReason: Admin permissions are required to delete messages in this chat.")
+            return
+        except FloodWaitError as fwe:
+            logger.warning(f"Flood wait of {fwe.seconds} seconds during deletion.")
+            await status_msg.edit(f"⏳ **Flood Wait:** Pausing for {fwe.seconds}s.")
+            await asyncio.sleep(fwe.seconds)
+            # Re-process the same chunk
+            try:
+                await user_client.delete_messages(target_entity, chunk)
+                deleted_count += len(chunk)
+            except Exception as e:
+                logger.error(f"Failed to delete chunk after flood wait: {e}")
+                await status_msg.edit(f"🚨 **Error after Flood Wait!**\nCould not delete messages. Task aborted. Reason: `{e}`")
+                return
+        except Exception as e:
+            logger.error(f"An error occurred during deletion: {e}")
+            await status_msg.edit(f"🚨 **An unexpected error occurred!** Task aborted. Reason: `{e}`")
+            return
+
+        elapsed = time.time() - start_time
+        try:
+            await status_msg.edit(f"**Deletion in Progress...**\n\n{format_progress_bar(deleted_count, total_count, elapsed)}")
+        except MessageIdInvalidError:
+            break
+        
+        await asyncio.sleep(state.delay) # Delay between chunks
+
+    summary = f"✅ **Deletion Complete!**\n\n**Deleted:** {deleted_count}/{total_count} messages."
+    try: await status_msg.edit(summary)
+    except MessageIdInvalidError: pass
+
+
 # --- Bot Command Handlers ---
 
 @bot_client.on(events.NewMessage(pattern='/start', from_users=OWNER_ID))
@@ -188,25 +251,29 @@ async def start_handler(event):
 @bot_client.on(events.NewMessage(pattern='/help', from_users=OWNER_ID))
 @owner_only
 async def help_handler(event):
+    # --- UPDATED: Help text with /delete command ---
     help_text = """
     **🤖 Userbot Command Center**
 
-    **Core Command:**
+    **Core Commands:**
     `/forward <start_url> <end_url> <dest_url>`
-    Forwards messages. Use `/header off` to forward without the "Forwarded from" tag.
-    *Shorthand:* `/forward <start_id> <end_id>` (if defaults are set).
+    Forwards messages. Use `/header off` to copy instead of forward.
+    *Shorthand:* `/forward <start_id> <end_id>`
+
+    `/delete <start_url> <end_url>`
+    Deletes all messages in the specified range. Requires admin rights.
 
     **Task Management:**
     `/cancel` - Stops the current task and clears the queue.
     `/status` - Shows current settings and queue status.
 
     **Configuration:**
-    `/header <on/off>` - Toggle the 'Forwarded from' header. `off` will copy messages.
-    `/set_source <@username or chat_id>` - Sets the default source channel.
-    `/set_dest <@username or chat_id>` - Sets the default destination channel.
-    `/set_delay <seconds>` - Sets delay between messages (e.g., `1.5`).
-    `/filter <type...>` - Excludes message types (e.g., `photo video`).
-    `/filters` - Shows current content filters. To clear, use `/filter` with no types.
+    `/header <on/off>` - Toggle the 'Forwarded from' header.
+    `/set_source <@username or chat_id>` - Sets the default source.
+    `/set_dest <@username or chat_id>` - Sets the default destination.
+    `/set_delay <seconds>` - Sets delay between batches (default: 1.0s).
+    `/filter <type...>` - Excludes message types from forwarding.
+    `/filters` - Shows current content filters.
     """
     await event.respond(help_text, link_preview=False)
 
@@ -230,17 +297,17 @@ async def forward_command_handler(event):
             await event.respond(f"**Invalid Syntax.**\n**Usage:** `/forward <start_url> <end_url> <dest_url>`\nOr set defaults and use `/forward <start_id> <end_id>`")
             return
     except (ValueError, TypeError):
-        await event.respond("❌ Invalid message IDs. Please provide numbers for start/end IDs.")
+        await event.respond("❌ Invalid message IDs. Please provide numbers.")
         return
     except Exception as e:
-        await event.respond(f"❌ An error occurred while parsing inputs: `{e}`")
+        await event.respond(f"❌ Error parsing inputs: `{e}`")
         return
 
     if not all([source_entity, dest_entity, start_id, end_id]):
         await event.respond("❌ Could not process inputs. Check your URLs or default settings."); return
 
     if end_id < start_id:
-        await event.respond("❌ Error: The end message ID must be greater than the start message ID.")
+        await event.respond("❌ Error: The end message ID must be greater than the start ID.")
         return
 
     task = {
@@ -257,6 +324,49 @@ async def forward_command_handler(event):
     if not state.is_running_task:
         asyncio.create_task(worker())
 
+# --- NEW: Delete Command Handler ---
+@bot_client.on(events.NewMessage(pattern=r'/delete', from_users=OWNER_ID))
+@owner_only
+async def delete_command_handler(event):
+    args = event.text.split()[1:]
+
+    if len(args) != 2:
+        await event.respond("**Invalid Syntax.**\n**Usage:** `/delete <start_message_url> <end_message_url>`")
+        return
+
+    try:
+        start_entity, start_id = await parse_message_url(args[0])
+        end_entity, end_id = await parse_message_url(args[1])
+    except Exception as e:
+        await event.respond(f"❌ Error parsing URLs: `{e}`")
+        return
+
+    if not all([start_entity, start_id, end_entity, end_id]):
+        await event.respond("❌ Could not parse one or both of the message URLs.")
+        return
+
+    if start_entity.id != end_entity.id:
+        await event.respond("❌ Error: The start and end message links must be from the same chat.")
+        return
+
+    if end_id < start_id:
+        await event.respond("❌ Error: The end message ID must be greater than the start ID.")
+        return
+
+    task = {
+        'type': 'delete',
+        'chat_id': event.chat_id,
+        'target_id': start_entity.id,
+        'start_id': start_id,
+        'end_id': end_id,
+    }
+    
+    await event.respond(f"✅ **Delete Task Queued!** Position: `#{len(state.task_queue) + 1}`.")
+    state.task_queue.append(task)
+    if not state.is_running_task:
+        asyncio.create_task(worker())
+
+
 @bot_client.on(events.NewMessage(pattern=r'/set_source|/set_dest', from_users=OWNER_ID))
 @owner_only
 async def set_default_handler(event):
@@ -265,10 +375,8 @@ async def set_default_handler(event):
     
     try:
         entity_identifier = event.text.split(maxsplit=1)[1]
-        try:
-            entity_identifier = int(entity_identifier)
-        except ValueError:
-            pass 
+        try: entity_identifier = int(entity_identifier)
+        except ValueError: pass 
 
         entity = await user_client.get_entity(entity_identifier)
         entity_name = entity.title if hasattr(entity, 'title') else entity.first_name
@@ -285,6 +393,7 @@ async def set_default_handler(event):
     except Exception as e:
         await event.respond(f"❌ **Error:** Could not find entity. `{e}`")
 
+
 @bot_client.on(events.NewMessage(pattern='/header', from_users=OWNER_ID))
 @owner_only
 async def header_handler(event):
@@ -292,16 +401,15 @@ async def header_handler(event):
         arg = event.text.split(maxsplit=1)[1].lower()
         if arg == 'on':
             state.forward_header = True
-            await event.respond("✅ **Forward header is now ON.**\nMessages will show 'Forwarded from'.")
+            await event.respond("✅ **Forward header is now ON.**")
         elif arg == 'off':
             state.forward_header = False
-            await event.respond("✅ **Forward header is now OFF.**\nMessages will be copied without the header.")
+            await event.respond("✅ **Forward header is now OFF.**")
         else:
             await event.respond("Usage: `/header <on/off>`")
     except IndexError:
-        await event.respond(f"Header is currently **{'ON' if state.forward_header else 'OFF'}**.\nUsage: `/header <on/off>`")
+        await event.respond(f"Header is currently **{'ON' if state.forward_header else 'OFF'}**.")
 
-# ... (All other handlers: /cancel, /set_delay, /filter, /filters, /status remain the same) ...
 
 @bot_client.on(events.NewMessage(pattern='/cancel', from_users=OWNER_ID))
 @owner_only
@@ -313,6 +421,7 @@ async def cancel_handler(event):
     state.task_queue.clear()
     await event.respond("🛑 **Cancel request received!** The current task will stop, and the queue has been cleared.")
 
+
 @bot_client.on(events.NewMessage(pattern='/set_delay', from_users=OWNER_ID))
 @owner_only
 async def set_delay_handler(event):
@@ -322,9 +431,10 @@ async def set_delay_handler(event):
              await event.respond("❌ Delay cannot be negative.")
              return
         state.delay = delay
-        await event.respond(f"✅ **Delay set to {state.delay} seconds.**")
+        await event.respond(f"✅ **Delay between batches set to {state.delay} seconds.**")
     except (IndexError, ValueError):
         await event.respond(f"Usage: `/set_delay <seconds>`. Current: `{state.delay}`s.")
+
 
 @bot_client.on(events.NewMessage(pattern='/filter', from_users=OWNER_ID))
 @owner_only
@@ -339,9 +449,10 @@ async def filter_handler(event):
     added = set(arg for arg in args if arg in valid_filters)
     state.filters.update(added)
     if not added and args:
-        await event.respond("No valid filter types provided. Use `photo`, `video`, `document`, or `poll`.")
+        await event.respond("No valid filter types provided.")
     else:
         await event.respond(f"✅ **Filters updated.** Current filters: `{', '.join(state.filters) or 'None'}`")
+
 
 @bot_client.on(events.NewMessage(pattern='/filters', from_users=OWNER_ID))
 @owner_only
@@ -350,6 +461,7 @@ async def show_filters_handler(event):
         await event.respond("No content filters are active.")
     else:
         await event.respond(f"**Active Content Filters:**\n- `{'`\n- `'.join(state.filters)}`")
+
 
 @bot_client.on(events.NewMessage(pattern='/status', from_users=OWNER_ID))
 @owner_only
@@ -388,7 +500,7 @@ async def main():
     await user_client.start()
     me = await user_client.get_me()
     logger.info(f"User client started as {me.first_name}.")
-    await bot_client.send_message(OWNER_ID, "✅ **Bot is online and ready!** (v2 - Simplified)")
+    await bot_client.send_message(OWNER_ID, "✅ **Bot is online and ready!**")
     logger.info("Bot is running...")
     await bot_client.run_until_disconnected()
 
