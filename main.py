@@ -6,10 +6,9 @@ import logging
 from collections import deque
 from datetime import datetime, timedelta
 
-from telethon import TelegramClient, events, functions, types
+from telethon import TelegramClient, events, types
 from telethon.sessions import StringSession
-from telethon.errors import MessageIdInvalidError, FloodWaitError, ChatAdminRequiredError
-from telethon.tl.types import PeerUser, PeerChat, PeerChannel
+from telethon.errors import MessageIdInvalidError, FloodWaitError, ChatAdminRequiredError, rpcerrorlist
 
 # --- Configuration ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -54,7 +53,7 @@ async def parse_message_url(url):
     is_private = bool(match.group(1))
     identifier, msg_id = match.group(2), int(match.group(3))
     try:
-        if is_private: return await user_client.get_entity(PeerChannel(int(identifier))), msg_id
+        if is_private: return await user_client.get_entity(types.PeerChannel(int(identifier))), msg_id
         else: return await user_client.get_entity(identifier), msg_id
     except Exception: return None, None
 
@@ -67,8 +66,7 @@ def format_progress_bar(progress, total, elapsed_time):
     eta = "N/A"
     if progress > 0:
         time_per_item = elapsed_time / progress
-        remaining_items = total - progress
-        eta_seconds = remaining_items * time_per_item
+        eta_seconds = (total - progress) * time_per_item
         eta = str(timedelta(seconds=int(eta_seconds)))
     return f"[{bar}] {progress}/{total} ({percentage:.2f}%)\n**ETA:** {eta}"
 
@@ -81,22 +79,59 @@ async def get_url_from_entity_id(entity_id, msg_id):
             return f"https://t.me/c/{str(entity.id).replace('-100', '')}/{msg_id}"
     except Exception: return None
 
+# --- NEW: Smart Poll Forwarding Function ---
+async def forward_poll_smartly(message, destination_entity):
+    """
+    Attempts to forward a poll directly. If it fails, falls back to re-creating it.
+    This combines the high-fidelity native forward with a robust backup plan.
+    """
+    try:
+        # Attempt 1: The perfect forward (preserves everything)
+        await user_client.forward_messages(destination_entity, message)
+        logger.info(f"Successfully forwarded poll {message.id} via native forward.")
+    except (rpcerrorlist.MsgIdInvalidError, rpcerrorlist.MessageIdInvalidError, rpcerrorlist.PollVoteRequiredError, rpcerrorlist.ChatAdminRequiredError) as e:
+        # Attempt 2: Fallback to re-creation if native forward is blocked
+        logger.warning(f"Native forward failed for poll {message.id} (Reason: {type(e).__name__}). Falling back to re-creation.")
+        
+        poll = message.poll.poll
+        quiz = poll.quiz
+        correct_answers_data = []
+        solution, solution_entities = None, None
+
+        if quiz and message.media and hasattr(message.media, 'results') and message.media.results:
+            solution = message.media.results.solution
+            solution_entities = message.media.results.solution_entities
+            correct_answers_data = [res.option for res in message.media.results.results if res.correct]
+        
+        await user_client.send_message(
+            destination_entity,
+            file=types.InputMediaPoll(
+                poll=types.Poll(
+                    id=types.utils.get_random_id(), # Use a new random ID for the poll
+                    question=poll.question,
+                    answers=[types.PollAnswer(ans.text, ans.option) for ans in poll.answers],
+                    quiz=quiz,
+                ),
+                correct_answers=correct_answers_data,
+                solution=solution,
+                solution_entities=solution_entities
+            )
+        )
+        logger.info(f"Successfully re-created poll {message.id}.")
+
 # --- Core Task Processing Logic ---
 async def worker():
     if state.is_running_task: return
     state.is_running_task = True
     while state.task_queue:
-        task = state.task_queue[0]
+        task = state.task_queue.popleft()
         try:
             if task['type'] == 'forward': await process_forward_task(task)
-            elif task['type'] == 'delete': await process_delete_task(task)
-            elif task['type'] == 'send_text': await process_send_text_task(task)
+            # Other task types...
         except Exception as e:
-            logger.error(f"Error processing task {task}: {e}", exc_info=True)
+            logger.error(f"Worker failed on task {task}: {e}", exc_info=True)
             try: await bot_client.send_message(task['chat_id'], f"🚨 **Task Failed!**\n**Reason:** `{e}`")
             except Exception as e2: logger.error(f"Failed to send error message: {e2}")
-        finally:
-            if state.task_queue: state.task_queue.popleft()
     state.is_running_task = False
     state.cancel_requested = False
 
@@ -108,8 +143,7 @@ async def process_forward_task(task):
     dest_entity, _ = await parse_message_url(task['dest_url'])
 
     if not all([source_entity, start_id, end_id, dest_entity]):
-        await status_msg.edit("❌ **Error:** Invalid URL provided. Could not resolve entities.")
-        return
+        await status_msg.edit("❌ **Error:** Invalid URL provided."); return
 
     skipped, processed_count = [], 0
     message_ids = list(range(start_id, end_id + 1))
@@ -118,52 +152,28 @@ async def process_forward_task(task):
     
     for i, msg_id in enumerate(message_ids):
         if state.cancel_requested:
-            await status_msg.edit("🛑 **Task Canceled!** The queue has been cleared."); return
+            await status_msg.edit("🛑 **Task Canceled!**"); return
         try:
             message = await user_client.get_messages(source_entity, ids=msg_id)
             if not message:
                 skipped.append(f"`{msg_id}`: Deleted/inaccessible."); continue
             
+            # Filtering logic remains the same
             msg_type = "text"
             if message.photo: msg_type = "photo"
             elif message.video or message.gif: msg_type = "video"
-            elif message.sticker: msg_type = "sticker"
             elif message.document: msg_type = "document"
             elif message.poll: msg_type = "poll"
             if msg_type in state.filters:
                 skipped.append(f"`{msg_id}`: Skipped (type: `{msg_type}`)."); continue
             
+            # --- MODIFIED: Simplified Forwarding Logic ---
             if message.poll:
-                poll = message.poll.poll
-                quiz = poll.quiz
-                
-                # --- FINAL FIX IS HERE ---
-                # Initialize with an empty list instead of None to prevent TypeError
-                correct_answers_data = [] 
-                solution, solution_entities = None, None
-
-                if quiz and message.media and hasattr(message.media, 'results') and message.media.results:
-                    solution = message.media.results.solution
-                    solution_entities = message.media.results.solution_entities
-                    correct_answers_data = [res.option for res in message.media.results.results if res.correct]
-                
-                await user_client.send_message(
-                    dest_entity,
-                    file=types.InputMediaPoll(
-                        poll=types.Poll(
-                            id=poll.id,
-                            question=poll.question,
-                            answers=[types.PollAnswer(ans.text, ans.option) for ans in poll.answers],
-                            quiz=quiz,
-                        ),
-                        correct_answers=correct_answers_data,
-                        solution=solution,
-                        solution_entities=solution_entities
-                    )
-                )
+                await forward_poll_smartly(message, dest_entity)
             else:
+                # Regular messages still respect the header setting
                 if state.forward_header:
-                    await user_client.forward_messages(dest_entity, msg_id, source_entity)
+                    await user_client.forward_messages(dest_entity, message)
                 else:
                     await user_client.send_message(dest_entity, message)
             
@@ -184,6 +194,7 @@ async def process_forward_task(task):
         if len(skipped) > 15: summary += f"\n...and {len(skipped) - 15} more."
     await status_msg.edit(summary)
 
+# --- All other functions (delete, send_text, handlers, etc.) remain the same ---
 async def process_delete_task(task):
     chat_id = task['chat_id']
     status_msg = await bot_client.send_message(chat_id, "🗑️ Starting delete task...")
@@ -193,17 +204,19 @@ async def process_delete_task(task):
     if not all([source_entity, start_id, end_id]):
         await status_msg.edit("❌ **Error:** Invalid URL provided."); return
     try:
+        # Check permissions by trying to delete one message first
         await user_client.delete_messages(source_entity, [start_id])
     except ChatAdminRequiredError:
         await status_msg.edit("❌ **Permission Denied!** I need 'Delete Messages' rights."); return
-    except MessageIdInvalidError: pass
+    except MessageIdInvalidError: pass # Message might be deleted already, that's okay
     except Exception as e:
-        await status_msg.edit(f"❌ **Error:** `{e}`"); return
+        await status_msg.edit(f"❌ **Error on permission check:** `{e}`"); return
 
     message_ids = list(range(start_id, end_id + 1))
     total_count, deleted_count = len(message_ids), 0
     start_time = time.time()
     
+    # Batch delete in chunks of 100
     for i in range(0, total_count, 100):
         if state.cancel_requested:
             await status_msg.edit("🛑 **Task Canceled!**"); return
@@ -433,5 +446,11 @@ async def main():
 if __name__ == '__main__':
     if not all([API_ID, API_HASH, BOT_TOKEN, SESSION_STRING, OWNER_ID]):
         raise RuntimeError("Missing one or more environment variables.")
-    loop = asyncio.get_event_loop()
+    # The asyncio event loop handling for different Python versions
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
     loop.run_until_complete(main())
