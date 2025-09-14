@@ -1,12 +1,12 @@
-# --- main.py v2.1 (with enhanced logging) ---
-# Adds more log messages to help us debug startup issues.
+# --- main.py v3 (Stable Async Structure) ---
+# This version fixes the asyncio event loop conflict between the two libraries.
 
 import os
 import asyncio
 import logging
 from flask import Flask
 from threading import Thread
-from telethon.sync import TelegramClient, events
+from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors.rpcerrorlist import FloodWaitError
 from telegram import Update
@@ -42,9 +42,10 @@ def keep_alive():
 # --- Task Queue and Worker Setup ---
 task_queue = asyncio.Queue()
 
-async def worker(user_bot):
+async def worker(user_bot, bot_app):
     LOGGER.info("Worker started, waiting for tasks.")
     while True:
+        task = None # Ensure task is defined
         try:
             task = await task_queue.get()
             chat_id = task['chat_id']
@@ -52,8 +53,7 @@ async def worker(user_bot):
             dest_id = task['dest_id']
             start_id = task['start_id']
             end_id = task['end_id']
-            bot = task['bot']
-
+            
             LOGGER.info(f"Processing task: Forward {source_id}:{start_id}-{end_id} to {dest_id}.")
             
             message_ids = list(range(start_id, end_id + 1))
@@ -64,25 +64,32 @@ async def worker(user_bot):
                     from_peer=source_id,
                     message_ids=message_ids
                 )
-                await bot.send_message(
+                await bot_app.bot.send_message(
                     chat_id=chat_id,
                     text=f"✅ Task completed: Forwarded messages from {start_id} to {end_id}."
                 )
             except FloodWaitError as e:
                 LOGGER.error(f"Flood wait error: sleeping for {e.seconds}s")
-                await bot.send_message(
+                await bot_app.bot.send_message(
                     chat_id=chat_id,
                     text=f"⚠️ Task paused due to Telegram limits. Will resume in {e.seconds} seconds."
                 )
                 await asyncio.sleep(e.seconds)
             except Exception as e:
                 LOGGER.error(f"An error occurred during forwarding: {e}")
-                await bot.send_message(chat_id=chat_id, text=f"❌ Error during forwarding: {e}")
+                await bot_app.bot.send_message(chat_id=chat_id, text=f"❌ Error during forwarding: {e}")
+            finally:
+                # FIX: task_done() is now called only after a task is processed.
+                task_queue.task_done()
 
+        except asyncio.CancelledError:
+            LOGGER.info("Worker task cancelled.")
+            break
         except Exception as e:
             LOGGER.error(f"Worker loop error: {e}")
-        finally:
-            task_queue.task_done()
+            if task:
+                task_queue.task_done()
+
 
 # --- Telegram Bot (Controller) Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -120,7 +127,6 @@ async def forward_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'dest_id': dest_id,
             'start_id': start_id,
             'end_id': end_id,
-            'bot': context.bot
         }
         
         await task_queue.put(task)
@@ -137,36 +143,41 @@ async def forward_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Main Application Logic ---
 async def main():
-    user_bot = None
-    try:
-        LOGGER.info("Starting User-Bot client...")
-        user_bot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-        await user_bot.start()
-        LOGGER.info("User-Bot client started successfully.")
+    """The main function to start both clients and the worker."""
+    LOGGER.info("Setting up Controller Bot...")
+    ptb_app = Application.builder().token(BOT_TOKEN).build()
 
-        LOGGER.info("Setting up Controller Bot...")
-        ptb_app = Application.builder().token(BOT_TOKEN).build()
-        ptb_app.bot_data['user_bot'] = user_bot
+    LOGGER.info("Starting User-Bot client...")
+    user_bot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    await user_bot.start()
+    LOGGER.info("User-Bot client started successfully.")
 
-        LOGGER.info("Registering command handlers...")
-        ptb_app.add_handler(CommandHandler("start", start))
-        ptb_app.add_handler(CommandHandler("ping", ping))
-        ptb_app.add_handler(CommandHandler("forward", forward_command))
-        LOGGER.info("Command handlers registered.")
+    ptb_app.bot_data['user_bot'] = user_bot
+
+    LOGGER.info("Registering command handlers...")
+    ptb_app.add_handler(CommandHandler("start", start))
+    ptb_app.add_handler(CommandHandler("ping", ping))
+    ptb_app.add_handler(CommandHandler("forward", forward_command))
+    LOGGER.info("Command handlers registered.")
+    
+    # NEW: We run all components as async tasks
+    async with ptb_app:
+        LOGGER.info("Starting controller bot polling...")
+        await ptb_app.start()
+        await ptb_app.updater.start_polling()
         
-        LOGGER.info("Creating worker task...")
-        asyncio.create_task(worker(user_bot))
-        LOGGER.info("Worker task created.")
+        LOGGER.info("Starting worker...")
+        worker_task = asyncio.create_task(worker(user_bot, ptb_app))
         
-        LOGGER.info("Controller Bot polling started.")
-        await ptb_app.run_polling()
-
-    except Exception as e:
-        LOGGER.error(f"An error occurred in the main function: {e}", exc_info=True)
-    finally:
-        if user_bot and user_bot.is_connected():
-            await user_bot.disconnect()
-            LOGGER.info("User-Bot client disconnected.")
+        # NEW: A forever loop to keep the script alive
+        LOGGER.info("Application is now running. Waiting for commands.")
+        await asyncio.Event().wait() # This will run forever until the process is stopped
+        
+        LOGGER.info("Shutting down...")
+        await ptb_app.updater.stop()
+        await ptb_app.stop()
+        worker_task.cancel()
+        await user_bot.disconnect()
 
 if __name__ == "__main__":
     keep_alive()
@@ -174,5 +185,8 @@ if __name__ == "__main__":
     LOGGER.info("Application starting...")
     try:
         asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        LOGGER.info("Application stopped cleanly.")
     except Exception as e:
         LOGGER.critical(f"Application failed to run: {e}", exc_info=True)
+
