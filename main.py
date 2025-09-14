@@ -3,6 +3,7 @@ import re
 import time
 import asyncio
 import logging
+import random # --- IMPORT ADDED ---
 from collections import deque
 from datetime import datetime, timedelta
 
@@ -99,8 +100,8 @@ async def _recreate_poll(message, destination_entity):
         destination_entity,
         file=types.InputMediaPoll(
             poll=types.Poll(
-                # --- BUG FIX: Removed the unstable id=utils.get_random_id() line ---
-                # Telegram will assign an ID automatically.
+                # --- BUG FIX: Provide a mandatory random 64-bit ID ---
+                id=random.getrandbits(64),
                 question=poll.question,
                 answers=[types.PollAnswer(ans.text, ans.option) for ans in poll.answers],
                 quiz=quiz,
@@ -521,7 +522,7 @@ async def main():
     await user_client.start()
     me = await user_client.get_me()
     logger.info(f"User client started as {me.first_name}.")
-    await bot_client.send_message(OWNER_ID, "✅ **Bot is online and ready!** (v4 - Stable)")
+    await bot_client.send_message(OWNER_ID, "✅ **Bot is online and ready!** (v5 - Final)")
     logger.info("Bot is running...")
     await bot_client.run_until_disconnected()
 
