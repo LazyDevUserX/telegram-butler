@@ -1,78 +1,54 @@
 import os
-import re
 import asyncio
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-from telethon.errors import MessageIdInvalidError
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from pyrogram import Client
+from telegram.ext import Application, CommandHandler
 
-# --- ENV Vars ---
+# =====================
+# ENVIRONMENT VARIABLES
+# =====================
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")
+SESSION_STRING = os.getenv("SESSION_STRING")  # Updated to match your env
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# --- URL Parser ---
-URL_REGEX = r"https://t\.me/(?P<chat>[\w\d_]+)/(?P<msg_id>\d+)"
+# =====================
+# USERBOT (Pyrogram)
+# =====================
+userbot = Client(
+    SESSION_STRING,
+    api_id=API_ID,
+    api_hash=API_HASH
+)
 
-def parse_msg_url(url: str):
-    match = re.match(URL_REGEX, url)
-    if not match:
-        raise ValueError("Invalid Telegram message URL")
-    return match.group("chat"), int(match.group("msg_id"))
+# =====================
+# TELEGRAM BOT (PTB v20+)
+# =====================
+async def start(update, context):
+    await update.message.reply_text("🤖 Hello! Bot is running on Render 🚀")
 
-# --- Forwarding Logic ---
-async def forward_message(userbot, source_url, dest_url):
-    src_chat, src_id = parse_msg_url(source_url)
-    dest_chat, _ = parse_msg_url(dest_url)  # msg_id ignored for dest
+async def help_command(update, context):
+    await update.message.reply_text("ℹ️ Available commands: /start /help")
 
-    msg = await userbot.get_messages(src_chat, ids=src_id)
-    if not msg:
-        raise MessageIdInvalidError("Message not found")
-
-    # Handle polls specially
-    if msg.poll:
-        await userbot.send_poll(
-            dest_chat,
-            question=msg.poll.question,
-            options=[o.text for o in msg.poll.options]
-        )
-    else:
-        await userbot.forward_messages(dest_chat, msg)
-
-# --- Bot Handlers ---
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong ✅")
-
-async def forward_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        return await update.message.reply_text("Usage: /forward_one <source_url> <dest_url>")
-
-    source_url, dest_url = context.args[0], context.args[1]
-    try:
-        await forward_message(context.userbot, source_url, dest_url)
-        await update.message.reply_text(f"✅ Forwarded from {source_url} → {dest_url}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-
-# --- Main Startup ---
-async def main():
-    # Start Telethon userbot
-    userbot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    await userbot.start()
-    print("✅ Userbot logged in")
-
-    # Start control bot
+async def run_bot():
     app = Application.builder().token(BOT_TOKEN).build()
-    app.userbot = userbot
 
-    app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("forward_one", forward_one))
+    # Handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
 
-    print("🤖 Control bot starting...")
-    # run_polling is async in v20+
+    print("✅ Bot logged in")
     await app.run_polling()
+
+# =====================
+# MAIN ENTRY POINT
+# =====================
+async def main():
+    # Start both userbot and bot concurrently
+    async with userbot:
+        print("✅ Userbot logged in")
+        await asyncio.gather(
+            run_bot(),
+        )
 
 if __name__ == "__main__":
     asyncio.run(main())
