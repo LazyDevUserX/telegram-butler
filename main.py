@@ -177,14 +177,20 @@ async def process_forward_task(task):
     total_count = len(message_ids)
     start_time = time.time()
 
-    for i, msg_id in enumerate(message_ids):
+    # --- BUG FIX: Changed to a while loop for robust flood wait handling ---
+    i = 0
+    while i < len(message_ids):
         if state.cancel_requested:
             await status_msg.edit("🛑 **Task Canceled by User!**"); return
+        
+        msg_id = message_ids[i]
 
         try:
             message = await user_client.get_messages(source_entity, ids=msg_id)
             if not message:
-                skipped.append(f"`{msg_id}`: Deleted or inaccessible."); continue
+                skipped.append(f"`{msg_id}`: Deleted or inaccessible."); 
+                i += 1
+                continue
 
             # Determine message type for filtering
             msg_type = "text"
@@ -194,11 +200,12 @@ async def process_forward_task(task):
             elif message.poll: msg_type = "poll"
 
             if msg_type in state.filters:
-                skipped.append(f"`{msg_id}`: Skipped (type: `{msg_type}`)."); continue
+                skipped.append(f"`{msg_id}`: Skipped (type: `{msg_type}`).")
+                i += 1
+                continue
 
             # --- MAIN FORWARDING LOGIC ---
             if message.poll:
-                # If the poll is already a forward, preserve the original header
                 if message.fwd_from:
                     logger.info(f"Message {msg_id} is a forwarded poll. Using native forward to preserve header.")
                     await user_client.forward_messages(dest_entity, message)
@@ -214,12 +221,10 @@ async def process_forward_task(task):
             
             processed_count += 1
         except FloodWaitError as fwe:
-            logger.warning(f"Flood wait of {fwe.seconds} seconds.")
-            await status_msg.edit(f"⏳ **Flood Wait:** Pausing for {fwe.seconds}s.")
+            logger.warning(f"Flood wait of {fwe.seconds} seconds. Retrying message {msg_id}.")
+            await status_msg.edit(f"⏳ **Flood Wait:** Pausing for {fwe.seconds}s. Will retry automatically.")
             await asyncio.sleep(fwe.seconds)
-            # Re-process the same message after the wait
-            message_ids.insert(i, msg_id) 
-            continue
+            continue # Do not increment 'i', so the loop retries the same message
         except Exception as e:
             skipped.append(f"`{msg_id}`: Failed ({type(e).__name__})")
             logger.error(f"Failed to process message {msg_id}: {e}", exc_info=False)
@@ -232,6 +237,7 @@ async def process_forward_task(task):
                 break
         
         await asyncio.sleep(state.delay)
+        i += 1 # Move to the next message
 
     summary = f"✅ **Forwarding Complete!**\n\n**Processed:** {processed_count}/{total_count} messages."
     if skipped:
@@ -272,11 +278,10 @@ async def help_handler(event):
     `/set_dest <@username or chat_id>` - Sets the default destination channel.
     `/set_delay <seconds>` - Sets delay between messages (e.g., `1.5`).
     `/filter <type...>` - Excludes message types (e.g., `photo video`).
-    `/filters` - Shows current content filters.
+    `/filters` - Shows current content filters. To clear, use `/filter` with no types.
     """
     await event.respond(help_text, link_preview=False)
 
-## --- This is the handler for /forward and /force_forward ---
 @bot_client.on(events.NewMessage(pattern=r'/forward|/force_forward', from_users=OWNER_ID))
 @owner_only
 async def any_forward_command_handler(event):
@@ -288,12 +293,10 @@ async def any_forward_command_handler(event):
     start_id, end_id = None, None
 
     try:
-        # Full URLs provided: /forward <start_url> <end_url> <dest_url>
         if len(args) == 3:
             source_entity, start_id = await parse_message_url(args[0])
             _, end_id = await parse_message_url(args[1])
             dest_entity, _ = await parse_message_url(args[2])
-        # Shorthand with message IDs: /forward <start_id> <end_id>
         elif len(args) == 2 and state.default_source and state.default_dest:
             source_entity = await user_client.get_entity(state.default_source)
             dest_entity = await user_client.get_entity(state.default_dest)
@@ -322,7 +325,7 @@ async def any_forward_command_handler(event):
         'dest_id': dest_entity.id,
         'start_id': start_id,
         'end_id': end_id,
-        'force_recreate': is_force_forward # Flag for the worker
+        'force_recreate': is_force_forward
     }
 
     command_name = "Force Forward" if is_force_forward else "Forward"
@@ -331,7 +334,6 @@ async def any_forward_command_handler(event):
     if not state.is_running_task:
         asyncio.create_task(worker())
 
-## --- This is the handler for /set_source and /set_dest ---
 @bot_client.on(events.NewMessage(pattern=r'/set_source|/set_dest', from_users=OWNER_ID))
 @owner_only
 async def set_default_handler(event):
@@ -340,21 +342,22 @@ async def set_default_handler(event):
     
     try:
         entity_identifier = event.text.split(maxsplit=1)[1]
-        
-        # Try to parse as integer (for chat IDs like -100...)
         try:
             entity_identifier = int(entity_identifier)
         except ValueError:
-            pass # It's a username, proceed as string
+            pass 
 
         entity = await user_client.get_entity(entity_identifier)
         
+        # --- BUG FIX: Safely get the name for both channels and users ---
+        entity_name = entity.title if hasattr(entity, 'title') else entity.first_name
+        
         if is_source:
             state.default_source = entity.id
-            await event.respond(f"✅ **Default source set to:** `{getattr(entity, 'title', entity.first_name)}`")
+            await event.respond(f"✅ **Default source set to:** `{entity_name}`")
         else:
             state.default_dest = entity.id
-            await event.respond(f"✅ **Default destination set to:** `{getattr(entity, 'title', entity.first_name)}`")
+            await event.respond(f"✅ **Default destination set to:** `{entity_name}`")
 
     except IndexError:
         await event.respond(f"**Usage:** `{command} <@username or chat_id>`")
@@ -432,12 +435,14 @@ async def status_handler(event):
     if state.default_source:
         try: 
             entity = await user_client.get_entity(state.default_source)
-            source_name = getattr(entity, 'title', entity.first_name)
+            # --- BUG FIX: Safely get the name for both channels and users ---
+            source_name = entity.title if hasattr(entity, 'title') else entity.first_name
         except: source_name = f"ID: {state.default_source} (Inaccessible)"
     if state.default_dest:
         try: 
             entity = await user_client.get_entity(state.default_dest)
-            dest_name = getattr(entity, 'title', entity.first_name)
+            # --- BUG FIX: Safely get the name for both channels and users ---
+            dest_name = entity.title if hasattr(entity, 'title') else entity.first_name
         except: dest_name = f"ID: {state.default_dest} (Inaccessible)"
 
     status_text = f"""
