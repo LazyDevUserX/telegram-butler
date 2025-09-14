@@ -121,6 +121,13 @@ async def handle_forward_task(user_bot, bot_app, task):
                 await user_bot.forward_messages(entity=dest_id, messages=msg_id, from_peer=source_id)
             # Otherwise (header is OFF or it IS a poll), re-create the message
             else:
+                # NEW: Built-in text replacement for polls and messages
+                if original_message.poll and '[REMEDICS]' in original_message.poll.question:
+                    original_message.poll.question = original_message.poll.question.replace('[REMEDICS]', '[MediX]')
+                
+                if original_message.text and '[REMEDICS]' in original_message.text:
+                    original_message.text = original_message.text.replace('[REMEDICS]', '[MediX]')
+
                 await user_bot.send_message(dest_id, original_message)
 
             processed_count += 1
@@ -397,7 +404,7 @@ async def main():
     
     async with ptb_app:
         LOGGER.info("Starting controller bot polling...")
-        await pt.start()
+        await ptb_app.start()
         await ptb_app.updater.start_polling()
         
         if OWNER_ID:
@@ -428,4 +435,3 @@ if __name__ == "__main__":
         LOGGER.info("Application stopped cleanly.")
     except Exception as e:
         LOGGER.critical(f"Application failed to run: {e}", exc_info=True)
-
