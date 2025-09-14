@@ -1,5 +1,5 @@
-# --- main.py v2 ---
-# This version introduces the core task pipeline for forwarding messages.
+# --- main.py v2.1 (with enhanced logging) ---
+# Adds more log messages to help us debug startup issues.
 
 import os
 import asyncio
@@ -13,7 +13,6 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # --- Configuration ---
-# Load environment variables
 API_ID = os.environ.get('API_ID')
 API_HASH = os.environ.get('API_HASH')
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
@@ -38,16 +37,15 @@ def run_flask():
 def keep_alive():
     t = Thread(target=run_flask)
     t.start()
+    LOGGER.info("Keep-alive server started.")
 
-# --- NEW: Task Queue and Worker Setup ---
+# --- Task Queue and Worker Setup ---
 task_queue = asyncio.Queue()
 
 async def worker(user_bot):
-    """The worker function that processes tasks from the queue."""
     LOGGER.info("Worker started, waiting for tasks.")
     while True:
         try:
-            # Wait for a task to appear in the queue
             task = await task_queue.get()
             chat_id = task['chat_id']
             source_id = task['source_id']
@@ -56,13 +54,11 @@ async def worker(user_bot):
             end_id = task['end_id']
             bot = task['bot']
 
-            LOGGER.info(f"Starting forward task from {source_id} to {dest_id}, messages {start_id}-{end_id}.")
+            LOGGER.info(f"Processing task: Forward {source_id}:{start_id}-{end_id} to {dest_id}.")
             
-            # Message IDs to forward
             message_ids = list(range(start_id, end_id + 1))
             
             try:
-                # Use the user_bot (Telethon) to forward messages
                 await user_bot.forward_messages(
                     to_peer=dest_id,
                     from_peer=source_id,
@@ -79,7 +75,6 @@ async def worker(user_bot):
                     text=f"⚠️ Task paused due to Telegram limits. Will resume in {e.seconds} seconds."
                 )
                 await asyncio.sleep(e.seconds)
-                # We should ideally re-queue the task, but for now we'll just notify.
             except Exception as e:
                 LOGGER.error(f"An error occurred during forwarding: {e}")
                 await bot.send_message(chat_id=chat_id, text=f"❌ Error during forwarding: {e}")
@@ -87,7 +82,6 @@ async def worker(user_bot):
         except Exception as e:
             LOGGER.error(f"Worker loop error: {e}")
         finally:
-            # Mark the task as done
             task_queue.task_done()
 
 # --- Telegram Bot (Controller) Command Handlers ---
@@ -102,11 +96,8 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error pinging User-Bot: {e}")
 
-# NEW: /forward command handler
 async def forward_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /forward command and adds a task to the queue."""
     try:
-        # Command format: /forward <source_id> <dest_id> <start_id> <end_id>
         parts = update.message.text.split()
         if len(parts) != 5:
             await update.message.reply_text(
@@ -123,17 +114,15 @@ async def forward_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Error: Start message ID must be less than or equal to end ID.")
             return
 
-        # Create a task object
         task = {
             'chat_id': update.effective_chat.id,
             'source_id': source_id,
             'dest_id': dest_id,
             'start_id': start_id,
             'end_id': end_id,
-            'bot': context.bot  # Pass the bot instance for sending replies
+            'bot': context.bot
         }
         
-        # Add the task to our queue
         await task_queue.put(task)
         await update.message.reply_text("✅ Task added to the queue.")
 
@@ -148,47 +137,42 @@ async def forward_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Main Application Logic ---
 async def main():
-    """The main function to start both clients and the worker."""
-    user_bot = None  # Initialize to None
+    user_bot = None
     try:
-        # --- Start User-Bot (Telethon) ---
+        LOGGER.info("Starting User-Bot client...")
         user_bot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
         await user_bot.start()
         LOGGER.info("User-Bot client started successfully.")
 
-        # --- Start Controller Bot (python-telegram-bot) ---
+        LOGGER.info("Setting up Controller Bot...")
         ptb_app = Application.builder().token(BOT_TOKEN).build()
-        ptb_app.bot_data['user_bot'] = user_bot # Share user_bot instance with handlers
+        ptb_app.bot_data['user_bot'] = user_bot
 
-        # Register command handlers
+        LOGGER.info("Registering command handlers...")
         ptb_app.add_handler(CommandHandler("start", start))
         ptb_app.add_handler(CommandHandler("ping", ping))
-        ptb_app.add_handler(CommandHandler("forward", forward_command)) # NEW
-
-        # --- Start the Worker ---
-        # The worker needs access to the user_bot client to perform its tasks
-        asyncio.create_task(worker(user_bot))
+        ptb_app.add_handler(CommandHandler("forward", forward_command))
+        LOGGER.info("Command handlers registered.")
         
-        # Start polling for bot updates
+        LOGGER.info("Creating worker task...")
+        asyncio.create_task(worker(user_bot))
+        LOGGER.info("Worker task created.")
+        
         LOGGER.info("Controller Bot polling started.")
         await ptb_app.run_polling()
 
     except Exception as e:
-        LOGGER.error(f"An error occurred in the main function: {e}")
+        LOGGER.error(f"An error occurred in the main function: {e}", exc_info=True)
     finally:
         if user_bot and user_bot.is_connected():
             await user_bot.disconnect()
             LOGGER.info("User-Bot client disconnected.")
 
 if __name__ == "__main__":
-    keep_alive() # Start the Flask server
+    keep_alive()
     
-    # Run the main async function
+    LOGGER.info("Application starting...")
     try:
         asyncio.run(main())
-    except RuntimeError as e:
-        # This can happen on restart, we can often ignore it.
-        LOGGER.warning(f"Caught a RuntimeError, possibly during shutdown/restart: {e}")
     except Exception as e:
-        LOGGER.critical(f"Application failed to run: {e}")
-
+        LOGGER.critical(f"Application failed to run: {e}", exc_info=True)
