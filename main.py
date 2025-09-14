@@ -70,10 +70,9 @@ async def main():
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("forward_one", forward_one))
 
-    await app.initialize()
-    await app.start()
-    print("🤖 Control bot started")
-    await app.updater.start_polling()
+    print("🤖 Control bot starting...")
+    # run_polling is async in v20+
+    await app.run_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
