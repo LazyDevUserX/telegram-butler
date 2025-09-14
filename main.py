@@ -27,12 +27,11 @@ class BotState:
         self.task_queue = deque()
         self.is_running_task = False
         self.cancel_requested = False
-        # Default settings
         self.delay = 1.0
         self.filters = set()
         self.default_source = None
         self.default_dest = None
-        self.forward_header = True # MODIFIED: New setting for header control
+        self.forward_header = True
 
 state = BotState()
 
@@ -41,9 +40,7 @@ user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 bot_client = TelegramClient('bot', API_ID, API_HASH)
 
 # --- Helper Functions ---
-
 def owner_only(func):
-    """Decorator to restrict command usage to the bot owner."""
     async def wrapper(event):
         if event.sender_id != OWNER_ID:
             await event.respond("🚫 You are not authorized to use this bot.")
@@ -52,63 +49,39 @@ def owner_only(func):
     return wrapper
 
 async def parse_message_url(url):
-    """Parses a Telegram message URL and returns the entity and message ID."""
-    match = re.match(r'https://t.me/(c/)?(\w+)/(\d+)', url)
-    if not match:
-        return None, None
-    
-    is_private_channel = bool(match.group(1))
-    identifier = match.group(2)
-    msg_id = int(match.group(3))
-
-    if is_private_channel:
-        try:
-            return await user_client.get_entity(PeerChannel(int(identifier))), msg_id
-        except (ValueError, TypeError):
-             return None, None
-    else:
-        try:
-            return await user_client.get_entity(identifier), msg_id
-        except ValueError:
-            try:
-                return await user_client.get_entity(int(identifier)), msg_id
-            except (ValueError, TypeError):
-                return None, None
-
+    match = re.match(r'https://t.me/(c/)?([\w\d_]+)/(\d+)', url)
+    if not match: return None, None
+    is_private = bool(match.group(1))
+    identifier, msg_id = match.group(2), int(match.group(3))
+    try:
+        if is_private: return await user_client.get_entity(PeerChannel(int(identifier))), msg_id
+        else: return await user_client.get_entity(identifier), msg_id
+    except Exception: return None, None
 
 def format_progress_bar(progress, total, elapsed_time):
-    """Formats the progress bar string with ETA."""
     if total == 0: return "[---] 0/0 (0.00%) | ETA: N/A"
-    
     percentage = (progress / total) * 100
     bar_length = 10
     filled_length = int(bar_length * progress // total)
     bar = '█' * filled_length + '░' * (bar_length - filled_length)
-    
     eta = "N/A"
     if progress > 0:
         time_per_item = elapsed_time / progress
         remaining_items = total - progress
         eta_seconds = remaining_items * time_per_item
         eta = str(timedelta(seconds=int(eta_seconds)))
-
     return f"[{bar}] {progress}/{total} ({percentage:.2f}%)\n**ETA:** {eta}"
 
 async def get_url_from_entity_id(entity_id, msg_id):
-    """Constructs a t.me URL from an entity and message ID."""
     try:
         entity = await user_client.get_entity(entity_id)
         if hasattr(entity, 'username') and entity.username:
             return f"https://t.me/{entity.username}/{msg_id}"
         elif isinstance(entity, types.Channel):
             return f"https://t.me/c/{str(entity.id).replace('-100', '')}/{msg_id}"
-    except Exception as e:
-        logger.warning(f"Could not construct URL for entity {entity_id}: {e}")
-        return None
-    return None
+    except Exception: return None
 
 # --- Core Task Processing Logic ---
-
 async def worker():
     if state.is_running_task: return
     state.is_running_task = True
@@ -120,10 +93,8 @@ async def worker():
             elif task['type'] == 'send_text': await process_send_text_task(task)
         except Exception as e:
             logger.error(f"Error processing task {task}: {e}", exc_info=True)
-            try:
-                await bot_client.send_message(task['chat_id'], f"🚨 **Task Failed!**\n\n**Reason:** `{e}`")
-            except Exception as e2:
-                logger.error(f"Failed to even send the error message: {e2}")
+            try: await bot_client.send_message(task['chat_id'], f"🚨 **Task Failed!**\n**Reason:** `{e}`")
+            except Exception as e2: logger.error(f"Failed to send error message: {e2}")
         finally:
             if state.task_queue: state.task_queue.popleft()
     state.is_running_task = False
@@ -147,13 +118,11 @@ async def process_forward_task(task):
     
     for i, msg_id in enumerate(message_ids):
         if state.cancel_requested:
-            await status_msg.edit("🛑 **Task Canceled!** The queue has been cleared.")
-            return
+            await status_msg.edit("🛑 **Task Canceled!** The queue has been cleared."); return
         try:
             message = await user_client.get_messages(source_entity, ids=msg_id)
             if not message:
-                skipped.append(f"`{msg_id}`: Deleted/inaccessible.")
-                continue
+                skipped.append(f"`{msg_id}`: Deleted/inaccessible."); continue
             
             msg_type = "text"
             if message.photo: msg_type = "photo"
@@ -162,25 +131,21 @@ async def process_forward_task(task):
             elif message.document: msg_type = "document"
             elif message.poll: msg_type = "poll"
             if msg_type in state.filters:
-                skipped.append(f"`{msg_id}`: Skipped (type: `{msg_type}`).")
-                continue
+                skipped.append(f"`{msg_id}`: Skipped (type: `{msg_type}`)."); continue
             
-            # MODIFIED: Major logic update for poll and header handling
             if message.poll:
-                # Polls are always re-created to be active, so they never have a fwd header.
                 poll = message.poll.poll
                 quiz = poll.quiz
-                
-                correct_answers = None
-                solution = None
-                solution_entities = None
+                correct_answers_data = None
+                solution, solution_entities = None, None
 
-                if quiz and message.media and message.media.results:
+                if quiz and message.media and hasattr(message.media, 'results') and message.media.results:
                     solution = message.media.results.solution
                     solution_entities = message.media.results.solution_entities
-                    # Get correct answers from the results
-                    correct_answers = [result.option for result in message.media.results.results if result.correct]
-
+                    # --- CRITICAL FIX IS HERE ---
+                    # The API expects a list of byte strings, not integers.
+                    correct_answers_data = [res.option for res in message.media.results.results if res.correct]
+                
                 await user_client.send_message(
                     dest_entity,
                     file=types.InputMediaPoll(
@@ -190,13 +155,12 @@ async def process_forward_task(task):
                             answers=[types.PollAnswer(ans.text, ans.option) for ans in poll.answers],
                             quiz=quiz,
                         ),
-                        correct_answers=correct_answers,
+                        correct_answers=correct_answers_data,
                         solution=solution,
                         solution_entities=solution_entities
                     )
                 )
             else:
-                # Regular messages respect the /header setting
                 if state.forward_header:
                     await user_client.forward_messages(dest_entity, msg_id, source_entity)
                 else:
@@ -204,11 +168,10 @@ async def process_forward_task(task):
             
             processed_count += 1
         except FloodWaitError as fwe:
-            await status_msg.edit(f"⏳ **Flood Wait:** Pausing for {fwe.seconds}s.")
-            await asyncio.sleep(fwe.seconds)
-            continue
+            await status_msg.edit(f"⏳ **Flood Wait:** Pausing for {fwe.seconds}s."); await asyncio.sleep(fwe.seconds); continue
         except Exception as e:
-            skipped.append(f"`{msg_id}`: Failed ({type(e).__name__}).")
+            # Add more detailed error logging
+            skipped.append(f"`{msg_id}`: Failed ({type(e).__name__}: {e})")
         
         if i % 5 == 0 or i == total_count - 1:
             elapsed = time.time() - start_time
@@ -217,29 +180,25 @@ async def process_forward_task(task):
 
     summary = f"✅ **Forwarding Complete!**\n\n**Processed:** {processed_count}/{total_count} messages."
     if skipped:
-        summary += "\n\n**Skipped Messages:**\n" + "\n".join(skipped[:10])
-        if len(skipped) > 10: summary += f"\n...and {len(skipped) - 10} more."
+        summary += "\n\n**Skipped Messages Report:**\n" + "\n".join(skipped[:15])
+        if len(skipped) > 15: summary += f"\n...and {len(skipped) - 15} more."
     await status_msg.edit(summary)
 
 async def process_delete_task(task):
-    # This function remains unchanged
     chat_id = task['chat_id']
     status_msg = await bot_client.send_message(chat_id, "🗑️ Starting delete task...")
     source_entity, start_id = await parse_message_url(task['start_url'])
     _, end_id = await parse_message_url(task['end_url'])
 
     if not all([source_entity, start_id, end_id]):
-        await status_msg.edit("❌ **Error:** Invalid URL provided.")
-        return
+        await status_msg.edit("❌ **Error:** Invalid URL provided."); return
     try:
         await user_client.delete_messages(source_entity, [start_id])
     except ChatAdminRequiredError:
-        await status_msg.edit("❌ **Permission Denied!** I need 'Delete Messages' rights.")
-        return
+        await status_msg.edit("❌ **Permission Denied!** I need 'Delete Messages' rights."); return
     except MessageIdInvalidError: pass
     except Exception as e:
-        await status_msg.edit(f"❌ **Error:** `{e}`")
-        return
+        await status_msg.edit(f"❌ **Error:** `{e}`"); return
 
     message_ids = list(range(start_id, end_id + 1))
     total_count, deleted_count = len(message_ids), 0
@@ -258,11 +217,9 @@ async def process_delete_task(task):
         await status_msg.edit(f"**Deleting in Progress...**\n\n{format_progress_bar(deleted_count, total_count, elapsed)}")
         await asyncio.sleep(1)
 
-    await status_msg.edit(f"✅ **Deletion Complete!**\n\nAttempted to delete: {deleted_count}/{total_count}.")
-
+    await status_msg.edit(f"✅ **Deletion Complete!**\nAttempted to delete: {deleted_count}/{total_count}.")
 
 async def process_send_text_task(task):
-    # This function remains unchanged
     dest_entity, _ = await parse_message_url(task['dest_url'])
     if dest_entity:
         await user_client.send_message(dest_entity, task['text'])
@@ -270,16 +227,14 @@ async def process_send_text_task(task):
     else:
         await bot_client.send_message(task['chat_id'], f"❌ Invalid destination for `/send_text`.")
 
-# --- Bot Command Handlers (Updated) ---
-
+# --- Bot Command Handlers ---
 @bot_client.on(events.NewMessage(pattern='/start', from_users=OWNER_ID))
 async def start_handler(event):
-    await event.respond("👋 **Welcome to your Userbot Controller!**\n\nUse /help to see all available commands.")
+    await event.respond("👋 **Welcome to your Userbot Controller!**\nUse /help to see all commands.")
 
 @bot_client.on(events.NewMessage(pattern='/help', from_users=OWNER_ID))
 @owner_only
 async def help_handler(event):
-    # MODIFIED: Help text updated
     help_text = """
     **🤖 Userbot Command Center**
 
@@ -289,7 +244,7 @@ async def help_handler(event):
     *Shorthand:* `/forward <start_id> <end_id>` if defaults are set.
 
     `/delete <start_url> <end_url>`
-    Deletes messages from a channel where you are an admin.
+    Deletes messages. Requires admin rights.
     *Shorthand:* `/delete <start_id> <end_id>` if default source is set.
 
     `/send_text <dest_url> "Your message"`
@@ -301,21 +256,11 @@ async def help_handler(event):
     `/status` - Shows current settings and queue status.
 
     **Configuration:**
-    `/header <on/off>`
-    Toggle the 'Forwarded from' header for non-poll messages.
-    
-    `/set_source <@username or ID>`
-    Sets the default source channel (e.g., `my_channel` or `-100123...`).
-
-    `/set_dest <@username or ID>`
-    Sets the default destination channel.
-    
-    `/set_delay <seconds>`
-    Sets a delay between forwarded messages (e.g., `1.5`).
-
-    `/filter <type1> <type2> ...`
-    Excludes message types. Types: `photo`, `video`, `sticker`, `gif`, `document`, `poll`, `text`. Use `/filter clear` to reset.
-
+    `/header <on/off>` - Toggle the 'Forwarded from' header.
+    `/set_source <@username or ID>` - Sets the default source.
+    `/set_dest <@username or ID>` - Sets the default destination.
+    `/set_delay <seconds>` - Sets delay between messages.
+    `/filter <type...>` - Excludes message types (e.g. `photo video`).
     `/filters` - Shows current content filters.
     """
     await event.respond(help_text, link_preview=False)
@@ -323,28 +268,22 @@ async def help_handler(event):
 @bot_client.on(events.NewMessage(pattern='/forward', from_users=OWNER_ID))
 @owner_only
 async def forward_command_handler(event):
-    # MODIFIED: Removed -noheader flag logic
     parts = event.text.split()
     start_url, end_url, dest_url = None, None, None
     args = parts[1:]
 
     try:
-        if len(args) == 3: # /forward <start_url> <end_url> <dest_url>
+        if len(args) == 3:
             start_url, end_url, dest_url = args
-        elif len(args) == 2 and state.default_source and state.default_dest: # /forward <start_id> <end_id>
+        elif len(args) == 2 and state.default_source and state.default_dest:
             start_url = await get_url_from_entity_id(state.default_source, args[0])
             end_url = await get_url_from_entity_id(state.default_source, args[1])
-            dest_url = await get_url_from_entity_id(state.default_dest, 1) # Dummy msg id
-        elif len(args) == 3 and state.default_dest: # /forward <start_url> <end_url> (using default dest)
-            start_url, end_url = args
             dest_url = await get_url_from_entity_id(state.default_dest, 1)
         else:
-            await event.respond("Invalid syntax. See /help.")
-            return
+            await event.respond("Invalid syntax. See /help."); return
 
         if not all([start_url, end_url, dest_url]):
-             await event.respond("❌ Could not construct valid URLs from inputs/defaults. Please check your settings.")
-             return
+             await event.respond("❌ Could not construct valid URLs. Check inputs/defaults."); return
     except IndexError:
         await event.respond("Invalid syntax. See /help."); return
 
@@ -353,23 +292,19 @@ async def forward_command_handler(event):
     await event.respond(f"✅ **Forward Task Queued!** Position: `#{len(state.task_queue)}`.")
     if not state.is_running_task: asyncio.create_task(worker())
 
-
 @bot_client.on(events.NewMessage(pattern='/delete', from_users=OWNER_ID))
 @owner_only
 async def delete_command_handler(event):
-    # This handler remains unchanged
-    parts = event.text.split()
-    args = parts[1:]
+    parts, args = event.text.split(), event.text.split()[1:]
     start_url, end_url = None, None
 
     if len(args) == 2:
         if args[0].isdigit() and args[1].isdigit() and state.default_source:
              start_url = await get_url_from_entity_id(state.default_source, args[0])
              end_url = await get_url_from_entity_id(state.default_source, args[1])
-        else:
-             start_url, end_url = args
+        else: start_url, end_url = args
     else:
-        await event.respond("**Usage:** `/delete <start_url> <end_url>` or set a default source and use `/delete <start_id> <end_id>`."); return
+        await event.respond("Usage: `/delete <start_url> <end_url>` or set a default and use `/delete <start_id> <end_id>`."); return
     
     if not all([start_url, end_url]):
         await event.respond("❌ Could not construct valid URLs from inputs/defaults."); return
@@ -379,85 +314,66 @@ async def delete_command_handler(event):
     await event.respond(f"✅ **Delete Task Queued!** Position: `#{len(state.task_queue)}`.")
     if not state.is_running_task: asyncio.create_task(worker())
 
-
 @bot_client.on(events.NewMessage(pattern='/send_text', from_users=OWNER_ID))
 @owner_only
 async def send_text_handler(event):
-    # This handler remains unchanged
     match = re.match(r'/send_text\s+("([^"]+)"|(\S+)\s+"([^"]+)")', event.text)
     dest_url, text = None, None
 
     if match:
         if match.group(2) and state.default_dest:
-            text = match.group(2)
-            dest_url = await get_url_from_entity_id(state.default_dest, 1)
+            text, dest_url = match.group(2), await get_url_from_entity_id(state.default_dest, 1)
         elif match.group(3) and match.group(4):
-            dest_url = match.group(3)
-            if '/t.me/' in dest_url and len(dest_url.split('/')) < 5:
-                dest_url += "/1"
-            text = match.group(4)
+            dest_url, text = match.group(3), match.group(4)
+            if '/t.me/' in dest_url and len(dest_url.split('/')) < 5: dest_url += "/1"
     
     if not all([dest_url, text]):
-        await event.respond('**Usage:** `/send_text <dest> "msg"` or set a default dest and use `/send_text "msg"`'); return
+        await event.respond('Usage: `/send_text <dest> "msg"` or set default and use `/send_text "msg"`'); return
 
     task = {'type': 'send_text', 'chat_id': event.chat_id, 'dest_url': dest_url, 'text': text}
     state.task_queue.append(task)
     await event.respond(f"✅ **Text Message Queued!** Position: `#{len(state.task_queue)}`.")
     if not state.is_running_task: asyncio.create_task(worker())
 
-# NEW: Handler for the /header command
 @bot_client.on(events.NewMessage(pattern='/header', from_users=OWNER_ID))
 @owner_only
 async def header_handler(event):
     try:
         setting = event.text.split(maxsplit=1)[1].lower()
         if setting == "on":
-            state.forward_header = True
-            await event.respond("✅ **Header Enabled.** Messages will be forwarded with the 'Forwarded from' header.")
+            state.forward_header = True; await event.respond("✅ **Header Enabled.**")
         elif setting == "off":
-            state.forward_header = False
-            await event.respond("✅ **Header Disabled.** Messages will be re-posted without the forward header.")
+            state.forward_header = False; await event.respond("✅ **Header Disabled.**")
         else:
-            await event.respond("⚠️ **Invalid option.** Use `/header on` or `/header off`.")
+            await event.respond("⚠️ Invalid option. Use `/header on` or `/header off`.")
     except IndexError:
-        current_status = "ON" if state.forward_header else "OFF"
-        await event.respond(f"ℹ️ **Header status:** `{current_status}`. Use `/header on` or `/header off` to change it.")
+        await event.respond(f"ℹ️ Header status: `{'ON' if state.forward_header else 'OFF'}`.")
 
 @bot_client.on(events.NewMessage(pattern='/set_source|/set_dest', from_users=OWNER_ID))
 @owner_only
 async def set_default_handler(event):
-    # This handler remains unchanged
     command = event.pattern_match.string.split()[0]
     try:
         identifier = event.text.split(maxsplit=1)[1]
         try:
-            entity = await user_client.get_entity(int(identifier))
-            final_id = int(identifier)
+            entity = await user_client.get_entity(int(identifier)); final_id = int(identifier)
         except ValueError:
-            entity = await user_client.get_entity(identifier)
-            final_id = entity.id
+            entity = await user_client.get_entity(identifier); final_id = entity.id
 
-        if command == '/set_source':
-            state.default_source = final_id
-            await event.respond(f"✅ Default source channel set to: `{final_id}`")
-        else: # /set_dest
-            state.default_dest = final_id
-            await event.respond(f"✅ Default destination channel set to: `{final_id}`")
+        if command == '/set_source': state.default_source = final_id
+        else: state.default_dest = final_id
+        await event.respond(f"✅ Default {command.split('_')[1]} set to: `{final_id}`")
 
-    except IndexError:
-        await event.respond(f"**Usage:** `{command} <@username or channel_id>`")
-    except Exception as e:
-        await event.respond(f"❌ **Error:** Could not find or access that channel. Please check the username/ID. (`{e}`)")
+    except IndexError: await event.respond(f"Usage: `{command} <@username or channel_id>`")
+    except Exception as e: await event.respond(f"❌ Error: Could not find channel. (`{e}`)")
 
 @bot_client.on(events.NewMessage(pattern='/cancel', from_users=OWNER_ID))
 @owner_only
 async def cancel_handler(event):
     if not state.is_running_task and not state.task_queue:
-        await event.respond("🤷 No tasks are currently running or queued.")
-        return
-    state.cancel_requested = True
-    state.task_queue.clear()
-    await event.respond("🛑 **Cancellation Requested!** The current task will stop, and the queue has been cleared.")
+        await event.respond("🤷 No tasks are running or queued."); return
+    state.cancel_requested = True; state.task_queue.clear()
+    await event.respond("🛑 **Cancellation Requested!** Queue cleared.")
 
 @bot_client.on(events.NewMessage(pattern='/set_delay', from_users=OWNER_ID))
 @owner_only
@@ -465,24 +381,20 @@ async def set_delay_handler(event):
     try:
         delay = float(event.text.split()[1])
         if delay < 0: raise ValueError
-        state.delay = delay
-        await event.respond(f"✅ Delay set to `{delay}` seconds.")
-    except (ValueError, IndexError):
-        await event.respond("⚠️ Invalid value. Use a non-negative number like `1.5`.")
+        state.delay = delay; await event.respond(f"✅ Delay set to `{delay}` seconds.")
+    except (ValueError, IndexError): await event.respond("⚠️ Invalid value. Use a non-negative number.")
 
 @bot_client.on(events.NewMessage(pattern='/filter', from_users=OWNER_ID))
 @owner_only
 async def filter_handler(event):
     parts = event.text.split()[1:]
     valid_types = {'photo', 'video', 'sticker', 'gif', 'document', 'poll', 'text'}
-    if not parts:
-        await event.respond("**Usage:** `/filter <type1>...` or `/filter clear`"); return
+    if not parts: await event.respond("Usage: `/filter <type1>...` or `/filter clear`"); return
     if parts[0].lower() == 'clear':
-        state.filters.clear()
-        await event.respond("✅ All content filters cleared."); return
+        state.filters.clear(); await event.respond("✅ All content filters cleared."); return
     added = [t for t in parts if t in valid_types]; invalid = [t for t in parts if t not in valid_types]
     for f_type in added: state.filters.add(f_type)
-    response = f"✅ Filters updated. Now filtering: `{', '.join(sorted(list(state.filters)))}`\n" if added else ""
+    response = f"✅ Filters updated: `{', '.join(sorted(list(state.filters)))}`\n" if added else ""
     if invalid: response += f"⚠️ Invalid types ignored: `{', '.join(invalid)}`"
     await event.respond(response.strip())
 
@@ -494,8 +406,7 @@ async def show_filters_handler(event):
 @bot_client.on(events.NewMessage(pattern='/status', from_users=OWNER_ID))
 @owner_only
 async def status_handler(event):
-    # MODIFIED: Added header status
-    header_status = "ON (With 'Forwarded from' header)" if state.forward_header else "OFF (Re-posting messages)"
+    header_status = "ON" if state.forward_header else "OFF"
     status_text = f"""
 **⚙️ Bot Status & Configuration**
 
