@@ -60,9 +60,9 @@ async def worker(user_bot, bot_app):
             
             try:
                 await user_bot.forward_messages(
-                    to_peer=dest_id,
-                    from_peer=source_id,
-                    message_ids=message_ids
+                    entity=dest_id,
+                    messages=message_ids,
+                    from_peer=source_id
                 )
                 await bot_app.bot.send_message(
                     chat_id=chat_id,
@@ -189,4 +189,5 @@ if __name__ == "__main__":
         LOGGER.info("Application stopped cleanly.")
     except Exception as e:
         LOGGER.critical(f"Application failed to run: {e}", exc_info=True)
+
 
