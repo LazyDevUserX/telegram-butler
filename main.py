@@ -1,5 +1,5 @@
-# --- main.py v6 (Task Cancellation & Poll Forwarding Fix) ---
-# Adds a /cancel command and correctly handles forwarding polls.
+# --- main.py v6.1 (Poll Attribute Fix) ---
+# Corrects the path to access poll data to fix the forwarding error.
 
 import os
 import asyncio
@@ -121,9 +121,10 @@ async def handle_forward_task(user_bot, bot_app, task):
                 await user_bot.forward_messages(entity=dest_id, messages=msg_id, from_peer=source_id)
             # Otherwise (header is OFF or it IS a poll), re-create the message
             else:
-                # NEW: Built-in text replacement for polls and messages
-                if original_message.poll and '[REMEDICS]' in original_message.poll.question:
-                    original_message.poll.question = original_message.poll.question.replace('[REMEDICS]', '[MediX]')
+                # FIX: Access poll question via message.media.poll.question
+                if original_message.media and hasattr(original_message.media, 'poll'):
+                    if '[REMEDICS]' in original_message.media.poll.question:
+                        original_message.media.poll.question = original_message.media.poll.question.replace('[REMEDICS]', '[MediX]')
                 
                 if original_message.text and '[REMEDICS]' in original_message.text:
                     original_message.text = original_message.text.replace('[REMEDICS]', '[MediX]')
@@ -435,3 +436,4 @@ if __name__ == "__main__":
         LOGGER.info("Application stopped cleanly.")
     except Exception as e:
         LOGGER.critical(f"Application failed to run: {e}", exc_info=True)
+
