@@ -9,14 +9,13 @@ from datetime import datetime, timedelta
 from telethon import TelegramClient, events, types
 from telethon.sessions import StringSession
 from telethon.errors import MessageIdInvalidError, FloodWaitError, ChatAdminRequiredError, rpcerrorlist
-from telethon.tl.types import PeerUser, PeerChat, PeerChannel
+from telethon.tl.types import PeerChannel
 
 # --- Configuration ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- Environment Variables ---
-# Make sure to set these in your environment
 API_ID = os.environ.get('API_ID')
 API_HASH = os.environ.get('API_HASH')
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
@@ -31,8 +30,8 @@ class BotState:
         self.cancel_requested = False
         self.delay = 1.0
         self.filters = set()
-        self.default_source = None # Will store entity ID
-        self.default_dest = None   # Will store entity ID
+        self.default_source = None
+        self.default_dest = None
         self.forward_header = True
 
 state = BotState()
@@ -56,9 +55,9 @@ async def parse_message_url(url):
     match = re.match(r'https://t.me/(c/)?([\w\d_]+)/(\d+)', url)
     if not match: return None, None
     try:
-        if match.group(1): # Private channel link: t.me/c/channel_id/msg_id
+        if match.group(1):
             entity = await user_client.get_entity(PeerChannel(int(match.group(2))))
-        else: # Public channel/user link: t.me/username/msg_id
+        else:
             entity = await user_client.get_entity(match.group(2))
         msg_id = int(match.group(3))
         return entity, msg_id
@@ -80,63 +79,6 @@ def format_progress_bar(progress, total, elapsed_time):
         eta = str(timedelta(seconds=int(eta_seconds)))
     return f"[{bar}] {progress}/{total} ({percentage:.2f}%)\n**ETA:** {eta}"
 
-# --- Poll Re-creation Logic ---
-async def _recreate_poll(message, destination_entity):
-    """Builds and sends a new poll based on an existing one."""
-    if not message.poll: return
-    
-    poll = message.poll.poll
-    quiz = poll.quiz
-    correct_answers_data = []
-    solution, solution_entities = None, None
-
-    # Note: Accessing media.results.solution requires the user_client to have
-    # voted in the poll or for the quiz results to be public. This is a Telegram limitation.
-    if quiz and message.media and hasattr(message.media, 'results') and message.media.results:
-        solution = message.media.results.solution
-        solution_entities = message.media.results.solution_entities
-        if message.media.results.results:
-             correct_answers_data = [res.option for res in message.media.results.results if res.correct]
-
-    await user_client.send_message(
-        destination_entity,
-        file=types.InputMediaPoll(
-            poll=types.Poll(
-                id=types.utils.get_random_id(),
-                question=poll.question,
-                answers=[types.PollAnswer(ans.text, ans.option) for ans in poll.answers],
-                quiz=quiz,
-            ),
-            correct_answers=correct_answers_data if correct_answers_data else None,
-            solution=solution,
-            solution_entities=solution_entities
-        )
-    )
-    logger.info(f"Successfully re-created poll from message {message.id}.")
-
-async def forward_poll_smartly(message, destination_entity, header_off=False):
-    """
-    Handles poll forwarding. Tries a native forward and falls back to re-creation.
-    If header_off is True and user is admin in source, it forces re-creation.
-    """
-    if header_off:
-        try:
-            me = await user_client.get_me()
-            perms = await user_client.get_permissions(message.chat_id, me)
-            if perms and (perms.is_admin or perms.is_creator):
-                logger.info(f"Admin in source channel and header is off. Forcing poll re-creation.")
-                await _recreate_poll(message, destination_entity)
-                return
-        except Exception as e:
-            logger.warning(f"Could not check admin permissions for {message.chat_id}. Proceeding with default logic. Error: {e}")
-
-    try:
-        await user_client.forward_messages(destination_entity, message)
-        logger.info(f"Successfully forwarded poll {message.id} via native forward.")
-    except (rpcerrorlist.MsgIdInvalidError, rpcerrorlist.PollVoteRequiredError, rpcerrorlist.ChatAdminRequiredError) as e:
-        logger.warning(f"Native forward failed for poll {message.id} (Reason: {type(e).__name__}). Falling back to re-creation.")
-        await _recreate_poll(message, destination_entity)
-
 # --- Core Task Processing Logic ---
 async def worker():
     if state.is_running_task: return
@@ -149,7 +91,6 @@ async def worker():
         task = state.task_queue.popleft()
         try:
             if task['type'] == 'forward': await process_forward_task(task)
-            # Other task types would be handled here
         except Exception as e:
             logger.error(f"Worker failed on task {task}: {e}", exc_info=True)
             try: await bot_client.send_message(task['chat_id'], f"🚨 **Task Failed!**\n**Reason:** `{e}`")
@@ -177,7 +118,6 @@ async def process_forward_task(task):
     total_count = len(message_ids)
     start_time = time.time()
 
-    # --- BUG FIX: Changed to a while loop for robust flood wait handling ---
     i = 0
     while i < len(message_ids):
         if state.cancel_requested:
@@ -188,11 +128,10 @@ async def process_forward_task(task):
         try:
             message = await user_client.get_messages(source_entity, ids=msg_id)
             if not message:
-                skipped.append(f"`{msg_id}`: Deleted or inaccessible."); 
+                skipped.append(f"`{msg_id}`: Deleted or inaccessible.")
                 i += 1
                 continue
 
-            # Determine message type for filtering
             msg_type = "text"
             if message.photo: msg_type = "photo"
             elif message.video or message.gif: msg_type = "video"
@@ -204,40 +143,33 @@ async def process_forward_task(task):
                 i += 1
                 continue
 
-            # --- MAIN FORWARDING LOGIC ---
-            if message.poll:
-                if message.fwd_from:
-                    logger.info(f"Message {msg_id} is a forwarded poll. Using native forward to preserve header.")
-                    await user_client.forward_messages(dest_entity, message)
-                elif task.get('force_recreate', False):
-                    await _recreate_poll(message, dest_entity)
-                else:
-                    await forward_poll_smartly(message, dest_entity, header_off=(not state.forward_header))
+            # --- SIMPLIFIED FORWARDING LOGIC ---
+            if state.forward_header:
+                # Standard forward with "Forwarded from" header
+                await user_client.forward_messages(dest_entity, message)
             else:
-                if state.forward_header:
-                    await user_client.forward_messages(dest_entity, message)
-                else:
-                    await user_client.send_message(dest_entity, message)
+                # Copies the message content without the header. Works for all types.
+                await user_client.send_message(dest_entity, message)
             
             processed_count += 1
         except FloodWaitError as fwe:
             logger.warning(f"Flood wait of {fwe.seconds} seconds. Retrying message {msg_id}.")
             await status_msg.edit(f"⏳ **Flood Wait:** Pausing for {fwe.seconds}s. Will retry automatically.")
             await asyncio.sleep(fwe.seconds)
-            continue # Do not increment 'i', so the loop retries the same message
+            continue
         except Exception as e:
             skipped.append(f"`{msg_id}`: Failed ({type(e).__name__})")
             logger.error(f"Failed to process message {msg_id}: {e}", exc_info=False)
-
+        
         if i % 5 == 0 or i == total_count - 1:
             elapsed = time.time() - start_time
             try:
                 await status_msg.edit(f"**Forwarding in Progress...**\n\n{format_progress_bar(i + 1, total_count, elapsed)}")
-            except MessageIdInvalidError: # User might have deleted the status message
+            except MessageIdInvalidError:
                 break
         
         await asyncio.sleep(state.delay)
-        i += 1 # Move to the next message
+        i += 1
 
     summary = f"✅ **Forwarding Complete!**\n\n**Processed:** {processed_count}/{total_count} messages."
     if skipped:
@@ -259,21 +191,17 @@ async def help_handler(event):
     help_text = """
     **🤖 Userbot Command Center**
 
-    **Core Commands:**
+    **Core Command:**
     `/forward <start_url> <end_url> <dest_url>`
-    Forwards messages using smart logic.
+    Forwards messages. Use `/header off` to forward without the "Forwarded from" tag.
     *Shorthand:* `/forward <start_id> <end_id>` (if defaults are set).
-
-    `/force_forward <start_url> <end_url> <dest_url>`
-    Forces polls to be re-created instead of forwarded. This can bypass some restrictions and always removes the header.
-    *Shorthand:* `/force_forward <start_id> <end_id>`
 
     **Task Management:**
     `/cancel` - Stops the current task and clears the queue.
     `/status` - Shows current settings and queue status.
 
     **Configuration:**
-    `/header <on/off>` - Toggle the 'Forwarded from' header.
+    `/header <on/off>` - Toggle the 'Forwarded from' header. `off` will copy messages.
     `/set_source <@username or chat_id>` - Sets the default source channel.
     `/set_dest <@username or chat_id>` - Sets the default destination channel.
     `/set_delay <seconds>` - Sets delay between messages (e.g., `1.5`).
@@ -282,15 +210,12 @@ async def help_handler(event):
     """
     await event.respond(help_text, link_preview=False)
 
-@bot_client.on(events.NewMessage(pattern=r'/forward|/force_forward', from_users=OWNER_ID))
+@bot_client.on(events.NewMessage(pattern=r'/forward', from_users=OWNER_ID))
 @owner_only
-async def any_forward_command_handler(event):
-    command = event.pattern_match.string.split()[0]
-    is_force_forward = (command == '/force_forward')
+async def forward_command_handler(event):
     args = event.text.split()[1:]
     
-    source_entity, dest_entity = None, None
-    start_id, end_id = None, None
+    source_entity, dest_entity, start_id, end_id = None, None, None, None
 
     try:
         if len(args) == 3:
@@ -302,7 +227,7 @@ async def any_forward_command_handler(event):
             dest_entity = await user_client.get_entity(state.default_dest)
             start_id, end_id = int(args[0]), int(args[1])
         else:
-            await event.respond(f"**Invalid Syntax.**\n**Usage:** `{command} <start_url> <end_url> <dest_url>`\nOr set defaults and use `{command} <start_id> <end_id>`")
+            await event.respond(f"**Invalid Syntax.**\n**Usage:** `/forward <start_url> <end_url> <dest_url>`\nOr set defaults and use `/forward <start_id> <end_id>`")
             return
     except (ValueError, TypeError):
         await event.respond("❌ Invalid message IDs. Please provide numbers for start/end IDs.")
@@ -325,11 +250,9 @@ async def any_forward_command_handler(event):
         'dest_id': dest_entity.id,
         'start_id': start_id,
         'end_id': end_id,
-        'force_recreate': is_force_forward
     }
 
-    command_name = "Force Forward" if is_force_forward else "Forward"
-    await event.respond(f"✅ **{command_name} Task Queued!** Position: `#{len(state.task_queue) + 1}`.")
+    await event.respond(f"✅ **Forward Task Queued!** Position: `#{len(state.task_queue) + 1}`.")
     state.task_queue.append(task)
     if not state.is_running_task:
         asyncio.create_task(worker())
@@ -348,8 +271,6 @@ async def set_default_handler(event):
             pass 
 
         entity = await user_client.get_entity(entity_identifier)
-        
-        # --- BUG FIX: Safely get the name for both channels and users ---
         entity_name = entity.title if hasattr(entity, 'title') else entity.first_name
         
         if is_source:
@@ -371,14 +292,16 @@ async def header_handler(event):
         arg = event.text.split(maxsplit=1)[1].lower()
         if arg == 'on':
             state.forward_header = True
-            await event.respond("✅ **Forward header is now ON.**")
+            await event.respond("✅ **Forward header is now ON.**\nMessages will show 'Forwarded from'.")
         elif arg == 'off':
             state.forward_header = False
-            await event.respond("✅ **Forward header is now OFF.**")
+            await event.respond("✅ **Forward header is now OFF.**\nMessages will be copied without the header.")
         else:
             await event.respond("Usage: `/header <on/off>`")
     except IndexError:
         await event.respond(f"Header is currently **{'ON' if state.forward_header else 'OFF'}**.\nUsage: `/header <on/off>`")
+
+# ... (All other handlers: /cancel, /set_delay, /filter, /filters, /status remain the same) ...
 
 @bot_client.on(events.NewMessage(pattern='/cancel', from_users=OWNER_ID))
 @owner_only
@@ -435,13 +358,11 @@ async def status_handler(event):
     if state.default_source:
         try: 
             entity = await user_client.get_entity(state.default_source)
-            # --- BUG FIX: Safely get the name for both channels and users ---
             source_name = entity.title if hasattr(entity, 'title') else entity.first_name
         except: source_name = f"ID: {state.default_source} (Inaccessible)"
     if state.default_dest:
         try: 
             entity = await user_client.get_entity(state.default_dest)
-            # --- BUG FIX: Safely get the name for both channels and users ---
             dest_name = entity.title if hasattr(entity, 'title') else entity.first_name
         except: dest_name = f"ID: {state.default_dest} (Inaccessible)"
 
@@ -452,7 +373,7 @@ async def status_handler(event):
     **Worker Status:** `{'Running' if state.is_running_task else 'Idle'}`
 
     **Settings:**
-    - **Header:** `{'ON' if state.forward_header else 'OFF'}`
+    - **Header:** `{'ON (Standard Forward)' if state.forward_header else 'OFF (Copy Message)'}`
     - **Delay:** `{state.delay}` seconds
     - **Default Source:** `{source_name}`
     - **Default Destination:** `{dest_name}`
@@ -467,7 +388,7 @@ async def main():
     await user_client.start()
     me = await user_client.get_me()
     logger.info(f"User client started as {me.first_name}.")
-    await bot_client.send_message(OWNER_ID, "✅ **Bot is online and ready!**")
+    await bot_client.send_message(OWNER_ID, "✅ **Bot is online and ready!** (v2 - Simplified)")
     logger.info("Bot is running...")
     await bot_client.run_until_disconnected()
 
@@ -475,7 +396,6 @@ if __name__ == '__main__':
     if not all([API_ID, API_HASH, BOT_TOKEN, SESSION_STRING, OWNER_ID]):
         raise RuntimeError("Missing one or more required environment variables.")
     
-    # Standard asyncio event loop setup
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
