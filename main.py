@@ -5,6 +5,7 @@ import logging
 import random
 from telethon import TelegramClient, events, types
 from telethon.sessions import StringSession
+from telethon.tl.functions.messages import SendVoteRequest # <-- FIX: Added the correct import
 
 # --- Basic Configuration ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -47,7 +48,6 @@ settings = {
 async def set_source_handler(event):
     try:
         entity_id = event.text.split(maxsplit=1)[1]
-        # Telethon needs integer IDs for private channels
         try:
             entity_id = int(entity_id)
         except ValueError:
@@ -56,7 +56,6 @@ async def set_source_handler(event):
         entity = await user.get_entity(entity_id)
         settings['default_source'] = entity.id
         
-        # --- FIX: Replaced faulty name logic with a robust check ---
         entity_name = entity.title if hasattr(entity, 'title') else entity.first_name
         
         await event.respond(f"✅ **Default source set to:** `{entity_name}`")
@@ -75,7 +74,6 @@ async def set_dest_handler(event):
         entity = await user.get_entity(entity_id)
         settings['default_dest'] = entity.id
 
-        # --- FIX: Replaced faulty name logic with a robust check ---
         entity_name = entity.title if hasattr(entity, 'title') else entity.first_name
 
         await event.respond(f"✅ **Default destination set to:** `{entity_name}`")
@@ -156,7 +154,13 @@ async def forward_handler(event):
                             continue
                         
                         vote_option = message.poll.poll.answers[0].option
-                        await user.send_vote(source, message_id=message.id, options=[vote_option])
+                        
+                        # --- FIX: Replaced non-existent .send_vote() with the correct request ---
+                        await user(SendVoteRequest(
+                            peer=source,
+                            msg_id=message.id,
+                            options=[vote_option]
+                        ))
                         
                         await asyncio.sleep(1)
                         updated_message = await user.get_messages(source, ids=msg_id)
@@ -221,4 +225,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+        
