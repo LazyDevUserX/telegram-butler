@@ -173,11 +173,16 @@ async def handler_forward(event):
                     # --- Copy poll/quizzes safely ---
                     try:
                         poll_obj = msg.poll.poll
-                        question = poll_obj.question
-                        answers = [types.PollAnswer(a.text, a.option) for a in poll_obj.answers]
+                        # ✅ Extract text if it's TextWithEntities
+                        question = getattr(poll_obj.question, "text", poll_obj.question)
 
-                        if settings["replace"]:
+                        if settings["replace"] and isinstance(question, str):
                             question = question.replace("[REMEDICS]", "[MediX]")
+
+                        answers = [
+                            types.PollAnswer(a.text, a.option)
+                            for a in poll_obj.answers
+                        ]
 
                         correct_answers = []
                         solution = None
@@ -189,10 +194,14 @@ async def handler_forward(event):
                                 for r in results.results:
                                     if getattr(r, "correct", False):
                                         correct_answers.append(r.option)
-                                solution = getattr(results, "solution", None)
-                                solution_entities = getattr(results, "solution_entities", []) or []
-                                if solution and settings["replace"]:
+
+                            solution = getattr(results, "solution", None)
+                            if solution:
+                                solution = getattr(solution, "text", solution)
+                                if settings["replace"] and isinstance(solution, str):
                                     solution = solution.replace("[REMEDICS]", "[MediX]")
+
+                            solution_entities = getattr(results, "solution_entities", []) or []
 
                         await user.send_message(
                             dst,
