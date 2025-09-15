@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 API_ID = os.environ.get('API_ID')
 API_HASH = os.environ.get('API_HASH')
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-# --- FIX: Changed to read from SESSION_STRING to match your screenshot ---
 SESSION_STRING = os.environ.get('SESSION_STRING')
 OWNER_ID_STR = os.environ.get('OWNER_ID')
 
@@ -22,7 +21,6 @@ missing_vars = []
 if not API_ID: missing_vars.append("API_ID")
 if not API_HASH: missing_vars.append("API_HASH")
 if not BOT_TOKEN: missing_vars.append("BOT_TOKEN")
-# --- FIX: Updated the check to look for the correct variable name ---
 if not SESSION_STRING: missing_vars.append("SESSION_STRING")
 if not OWNER_ID_STR: missing_vars.append("OWNER_ID")
 
@@ -49,9 +47,19 @@ settings = {
 async def set_source_handler(event):
     try:
         entity_id = event.text.split(maxsplit=1)[1]
+        # Telethon needs integer IDs for private channels
+        try:
+            entity_id = int(entity_id)
+        except ValueError:
+            pass # It's a username, proceed as string
+            
         entity = await user.get_entity(entity_id)
         settings['default_source'] = entity.id
-        await event.respond(f"✅ **Default source set to:** `{getattr(entity, 'title', entity.first_name)}`")
+        
+        # --- FIX: Replaced faulty name logic with a robust check ---
+        entity_name = entity.title if hasattr(entity, 'title') else entity.first_name
+        
+        await event.respond(f"✅ **Default source set to:** `{entity_name}`")
     except Exception as e:
         await event.respond(f"❌ **Error:** Could not find entity. `{e}`")
 
@@ -59,9 +67,18 @@ async def set_source_handler(event):
 async def set_dest_handler(event):
     try:
         entity_id = event.text.split(maxsplit=1)[1]
+        try:
+            entity_id = int(entity_id)
+        except ValueError:
+            pass
+            
         entity = await user.get_entity(entity_id)
         settings['default_dest'] = entity.id
-        await event.respond(f"✅ **Default destination set to:** `{getattr(entity, 'title', entity.first_name)}`")
+
+        # --- FIX: Replaced faulty name logic with a robust check ---
+        entity_name = entity.title if hasattr(entity, 'title') else entity.first_name
+
+        await event.respond(f"✅ **Default destination set to:** `{entity_name}`")
     except Exception as e:
         await event.respond(f"❌ **Error:** Could not find entity. `{e}`")
 
