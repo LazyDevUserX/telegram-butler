@@ -5,7 +5,7 @@ import logging
 import random
 from telethon import TelegramClient, events, types
 from telethon.sessions import StringSession
-from telethon.tl.functions.messages import SendVoteRequest # <-- FIX: Added the correct import
+from telethon.tl.functions.messages import SendVoteRequest
 
 # --- Basic Configuration ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -154,8 +154,6 @@ async def forward_handler(event):
                             continue
                         
                         vote_option = message.poll.poll.answers[0].option
-                        
-                        # --- FIX: Replaced non-existent .send_vote() with the correct request ---
                         await user(SendVoteRequest(
                             peer=source,
                             msg_id=message.id,
@@ -175,12 +173,17 @@ async def forward_handler(event):
 
                         question = poll.question
                         answers = [types.PollAnswer(ans.text, ans.option) for ans in poll.answers]
+                        
+                        # --- FIX: Extract solution and entities together ---
                         correct_answers = []
                         solution = None
+                        solution_entities = None
                         
-                        if results.results:
-                            correct_answers = [res.option for res in results.results if res.correct]
-                        solution = results.solution
+                        if results:
+                            solution = results.solution
+                            solution_entities = results.solution_entities # <-- The missing piece
+                            if results.results:
+                                correct_answers = [res.option for res in results.results if res.correct]
                         
                         if settings['replace_on']:
                             question = question.replace("[REMEDICS]", "[MediX]")
@@ -192,7 +195,8 @@ async def forward_handler(event):
                             file=types.InputMediaPoll(
                                 poll=types.Poll(id=random.getrandbits(64), question=question, answers=answers, quiz=poll.quiz),
                                 correct_answers=correct_answers,
-                                solution=solution
+                                solution=solution,
+                                solution_entities=solution_entities # <-- Passing them together
                             )
                         )
                         logger.info(f"Successfully re-created poll from message {msg_id}.")
@@ -225,4 +229,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
+            
