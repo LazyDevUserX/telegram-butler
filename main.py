@@ -2,9 +2,9 @@ import asyncio
 import os
 import json
 import logging
-import random
 from telethon import TelegramClient, events, types
 from telethon.errors import BadRequestError
+from telethon.sessions import StringSession
 
 # ---------------------------
 # Logging setup
@@ -27,11 +27,16 @@ else:
 # ---------------------------
 # Telegram API setup
 # ---------------------------
-API_ID = int(os.getenv("API_ID", "123456"))  # replace with your api_id
-API_HASH = os.getenv("API_HASH", "your_api_hash")  # replace with your api_hash
-SESSION = "userbot"
+API_ID = int(os.getenv("API_ID", "123456"))   # must be set in Render
+API_HASH = os.getenv("API_HASH", "your_api_hash")  # must be set in Render
+SESSION_STRING = os.getenv("SESSION_STRING")
 
-client = TelegramClient(SESSION, API_ID, API_HASH)
+if SESSION_STRING:
+    logger.info("Using StringSession from environment")
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+else:
+    logger.info("Using local session file 'userbot.session'")
+    client = TelegramClient("userbot", API_ID, API_HASH)
 
 
 # ---------------------------
@@ -89,7 +94,8 @@ async def handler_forward(event):
     dst = settings["dst"]
 
     try:
-        if event.is_private or str(event.chat_id) != str(src):
+        # Only forward from the source chat
+        if str(event.chat_id) != str(src):
             return
 
         if event.poll:
@@ -98,17 +104,16 @@ async def handler_forward(event):
             return
 
         # Normal messages (text, media, etc.)
-        if event.message:
-            msg = event.message
+        msg = event.message
 
-            if msg.text and settings["replace"]:
-                # Replace brand name in text
-                new_text = msg.text.replace("[REMEDICS]", "[MediX]")
-                await client.send_message(dst, new_text, file=msg.media)
-            else:
-                await msg.forward_to(dst)
+        if msg.text and settings["replace"]:
+            # Replace brand name in text
+            new_text = msg.text.replace("[REMEDICS]", "[MediX]")
+            await client.send_message(dst, new_text, file=msg.media)
+        else:
+            await msg.forward_to(dst)
 
-            logger.info("✅ Message forwarded")
+        logger.info("✅ Message forwarded")
 
     except BadRequestError as e:
         logger.error("❌ Telegram API error: %s", e)
