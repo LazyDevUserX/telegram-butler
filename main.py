@@ -14,14 +14,16 @@ logger = logging.getLogger(__name__)
 API_ID = os.environ.get('API_ID')
 API_HASH = os.environ.get('API_HASH')
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-SESSION_STRING = os.environ.get('SESSION_ID')
+# --- FIX: Changed to read from SESSION_STRING to match your screenshot ---
+SESSION_STRING = os.environ.get('SESSION_STRING')
 OWNER_ID_STR = os.environ.get('OWNER_ID')
 
 missing_vars = []
 if not API_ID: missing_vars.append("API_ID")
 if not API_HASH: missing_vars.append("API_HASH")
 if not BOT_TOKEN: missing_vars.append("BOT_TOKEN")
-if not SESSION_STRING: missing_vars.append("SESSION_ID")
+# --- FIX: Updated the check to look for the correct variable name ---
+if not SESSION_STRING: missing_vars.append("SESSION_STRING")
 if not OWNER_ID_STR: missing_vars.append("OWNER_ID")
 
 if missing_vars:
@@ -139,7 +141,7 @@ async def forward_handler(event):
                         vote_option = message.poll.poll.answers[0].option
                         await user.send_vote(source, message_id=message.id, options=[vote_option])
                         
-                        await asyncio.sleep(1) # Give Telegram a moment to process the vote
+                        await asyncio.sleep(1)
                         updated_message = await user.get_messages(source, ids=msg_id)
 
                         if not (updated_message and updated_message.media and hasattr(updated_message.media, 'results') and updated_message.media.results):
@@ -202,4 +204,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-            
+    
