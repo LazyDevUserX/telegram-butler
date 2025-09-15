@@ -2,7 +2,9 @@ import os
 import re
 import asyncio
 import logging
+import random
 from telethon import TelegramClient, events, types
+from telethon.sessions import StringSession # <-- FIX: Added the missing import
 
 # --- Basic Configuration ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -11,7 +13,7 @@ logger = logging.getLogger(__name__)
 API_ID = os.environ.get('API_ID')
 API_HASH = os.environ.get('API_HASH')
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-SESSION_STRING = os.environ.get('SESSION_STRING')
+SESSION_STRING = os.environ.get('SESSION_ID') # <-- FIX: Changed to read from SESSION_ID
 OWNER_ID = int(os.environ.get('OWNER_ID'))
 
 # --- Simple In-Memory Settings ---
@@ -51,23 +53,33 @@ async def set_dest_handler(event):
 
 @bot.on(events.NewMessage(pattern='/header', from_users=OWNER_ID))
 async def header_handler(event):
-    arg = event.text.split(maxsplit=1)[1].lower()
-    if arg == 'on':
-        settings['header_on'] = True
-        await event.respond("✅ Header is **ON** (Standard Forward).")
-    elif arg == 'off':
-        settings['header_on'] = False
-        await event.respond("✅ Header is **OFF** (Copy/Re-create Mode).")
+    try:
+        arg = event.text.split(maxsplit=1)[1].lower()
+        if arg == 'on':
+            settings['header_on'] = True
+            await event.respond("✅ Header is **ON** (Standard Forward).")
+        elif arg == 'off':
+            settings['header_on'] = False
+            await event.respond("✅ Header is **OFF** (Copy/Re-create Mode).")
+        else:
+            await event.respond("Usage: `/header <on/off>`")
+    except IndexError:
+        await event.respond(f"Header is currently **{'ON' if settings['header_on'] else 'OFF'}**.")
 
 @bot.on(events.NewMessage(pattern='/replace', from_users=OWNER_ID))
 async def replace_handler(event):
-    arg = event.text.split(maxsplit=1)[1].lower()
-    if arg == 'on':
-        settings['replace_on'] = True
-        await event.respond("✅ Text replacement `[REMEDICS]` -> `[MediX]` is **ON**.")
-    elif arg == 'off':
-        settings['replace_on'] = False
-        await event.respond("✅ Text replacement is **OFF**.")
+    try:
+        arg = event.text.split(maxsplit=1)[1].lower()
+        if arg == 'on':
+            settings['replace_on'] = True
+            await event.respond("✅ Text replacement `[REMEDICS]` -> `[MediX]` is **ON**.")
+        elif arg == 'off':
+            settings['replace_on'] = False
+            await event.respond("✅ Text replacement is **OFF**.")
+        else:
+            await event.respond("Usage: `/replace <on/off>`")
+    except IndexError:
+        await event.respond(f"Replacement is currently **{'ON' if settings['replace_on'] else 'OFF'}**.")
 
 @bot.on(events.NewMessage(pattern='/forward', from_users=OWNER_ID))
 async def forward_handler(event):
@@ -108,12 +120,22 @@ async def forward_handler(event):
                     try:
                         logger.info(f"Voting on poll {msg_id} to access results...")
                         # 1. Vote on the first option to get results
+                        if not message.poll.poll.answers:
+                            logger.warning(f"Poll {msg_id} has no answers to vote on. Skipping.")
+                            skipped_count += 1
+                            continue
+                        
                         vote_option = message.poll.poll.answers[0].option
                         await user.send_vote(source, message_id=message.id, options=[vote_option])
                         
                         # 2. Re-fetch the message to get updated media with results
                         await asyncio.sleep(1) # Give Telegram a moment to process the vote
                         updated_message = await user.get_messages(source, ids=msg_id)
+
+                        if not (updated_message and updated_message.poll and updated_message.media and hasattr(updated_message.media, 'results')):
+                             logger.warning(f"Could not retrieve results for poll {msg_id} after voting. Skipping.")
+                             skipped_count += 1
+                             continue
 
                         poll = updated_message.poll.poll
                         results = updated_message.media.results
@@ -123,7 +145,7 @@ async def forward_handler(event):
                         answers = [types.PollAnswer(ans.text, ans.option) for ans in poll.answers]
                         correct_answers = []
                         solution = None
-                        if results:
+                        if results and results.results:
                             correct_answers = [res.option for res in results.results if res.correct]
                             solution = results.solution
                         
@@ -137,7 +159,7 @@ async def forward_handler(event):
                         await user.send_message(
                             dest,
                             file=types.InputMediaPoll(
-                                poll=types.Poll(id=message.id, question=question, answers=answers, quiz=poll.quiz),
+                                poll=types.Poll(id=random.getrandbits(64), question=question, answers=answers, quiz=poll.quiz),
                                 correct_answers=correct_answers,
                                 solution=solution
                             )
@@ -175,4 +197,4 @@ if __name__ == "__main__":
     if not all([API_ID, API_HASH, BOT_TOKEN, SESSION_STRING, OWNER_ID]):
         raise RuntimeError("One or more environment variables are missing.")
     asyncio.run(main())
-                        
+                                            
