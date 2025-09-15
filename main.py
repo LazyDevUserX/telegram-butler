@@ -1,21 +1,20 @@
 import asyncio
-import nest_asyncio
 import os
 import json
-import random
 import logging
+import random
 from telethon import TelegramClient, events, types
 from telethon.errors import BadRequestError
-from telethon.helpers import escape_markdown
 
-# Allow nested asyncio (needed for some environments)
-nest_asyncio.apply()
-
+# ---------------------------
 # Logging setup
+# ---------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ---------------------------
 # Load settings
+# ---------------------------
 SETTINGS_FILE = "settings.json"
 if os.path.exists(SETTINGS_FILE):
     with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -25,7 +24,9 @@ else:
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
 
+# ---------------------------
 # Telegram API setup
+# ---------------------------
 API_ID = int(os.getenv("API_ID", "123456"))  # replace with your api_id
 API_HASH = os.getenv("API_HASH", "your_api_hash")  # replace with your api_hash
 SESSION = "userbot"
@@ -33,6 +34,9 @@ SESSION = "userbot"
 client = TelegramClient(SESSION, API_ID, API_HASH)
 
 
+# ---------------------------
+# Poll copy helper
+# ---------------------------
 async def copy_poll(event, dst):
     """Safely rebuild and forward a poll without Telethon crashes."""
     try:
@@ -76,6 +80,9 @@ async def copy_poll(event, dst):
         await event.respond(f"⚠️ Poll skipped: {e}")
 
 
+# ---------------------------
+# Forward handler
+# ---------------------------
 @client.on(events.NewMessage)
 async def handler_forward(event):
     src = settings["src"]
@@ -111,6 +118,9 @@ async def handler_forward(event):
         await event.respond(f"⚠️ Error: {e}")
 
 
+# ---------------------------
+# Main entrypoint
+# ---------------------------
 async def main():
     await client.start()
     logger.info("✅ Userbot logged in and running...")
