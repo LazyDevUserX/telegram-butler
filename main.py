@@ -27,33 +27,33 @@ else:
 # ---------------------------
 # Telegram API setup
 # ---------------------------
-API_ID = int(os.getenv("API_ID", "123456"))   # must be set in Render
-API_HASH = os.getenv("API_HASH", "your_api_hash")  # must be set in Render
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
+# -- BOT CLIENT & OWNER ID --
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID"))
 
-if SESSION_STRING:
-    logger.info("Using StringSession from environment")
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-else:
-    logger.info("Using local session file 'userbot.session'")
-    client = TelegramClient("userbot", API_ID, API_HASH)
-
+# Initialize both clients
+user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+bot_client = TelegramClient('bot', API_ID, API_HASH)
 
 # ---------------------------
-# Poll copy helper
+# MODIFIED Poll copy helper
 # ---------------------------
-async def copy_poll(event, dst):
-    """Safely rebuild and forward a poll without Telethon crashes."""
+async def copy_poll(message, dst_chat):
+    """Safely rebuild and send a poll from a message object."""
     try:
-        orig = event.poll
+        # Access the poll from the message object
+        orig = message.poll.poll
 
         # Build a new poll object
         new_poll = types.Poll(
-            id=0,  # ✅ reset ID so Telegram generates it
-            question=types.TextWithEntities(text=orig.question, entities=[]),
+            id=0,
+            question=types.TextWithEntities(text=orig.question.text, entities=orig.question.entities or []),
             answers=[
                 types.PollAnswer(
-                    text=types.TextWithEntities(text=ans.text, entities=[]),
+                    text=types.TextWithEntities(text=ans.text.text, entities=ans.text.entities or []),
                     option=ans.option
                 )
                 for ans in orig.answers
@@ -64,73 +64,124 @@ async def copy_poll(event, dst):
 
         # Optional solution
         solution = None
-        if getattr(orig, "solution", None):
-            solution = types.TextWithEntities(
-                text=orig.solution,
-                entities=[]
-            )
+        solution_entities = None
+        if message.media.results:
+            solution = message.media.results.solution
+            solution_entities = message.media.results.solution_entities
 
         # Wrap into InputMediaPoll
         media = types.InputMediaPoll(
             poll=new_poll,
-            correct_answers=orig.correct_answers or [],
-            solution=solution
+            correct_answers=message.media.results.correct_answers if message.media.results else None,
+            solution=solution,
+            solution_entities=solution_entities
         )
 
-        # Send fresh poll
-        await event.client.send_file(dst, file=media)
-        logger.info("✅ Poll copied successfully")
+        # Send fresh poll using the user client
+        await user_client.send_file(dst_chat, file=media)
+        logger.info(f"✅ Poll from message {message.id} copied successfully")
+        return True
     except Exception as e:
-        logger.exception("⚠️ Poll copy failed: %s", e)
-        await event.respond(f"⚠️ Poll skipped: {e}")
-
+        logger.exception(f"⚠️ Poll copy for message {message.id} failed: {e}")
+        return False
 
 # ---------------------------
-# Forward handler
+# NEW /forward COMMAND
 # ---------------------------
-@client.on(events.NewMessage)
-async def handler_forward(event):
-    src = settings["src"]
-    dst = settings["dst"]
+@bot_client.on(events.NewMessage(pattern=r'/forward (\d+) (\d+)', from_users=OWNER_ID))
+async def forward_range_handler(event):
+    start_id = int(event.pattern_match.group(1))
+    end_id = int(event.pattern_match.group(2))
+
+    if start_id > end_id:
+        await event.respond("❌ **Error:** Start ID must be less than or equal to End ID.")
+        return
+
+    src = int(settings["src"])
+    dst = int(settings["dst"])
+    
+    status_msg = await event.respond(f"🚀 **Processing range {start_id}-{end_id}...**")
+    
+    processed = 0
+    failed = 0
+    total = (end_id - start_id) + 1
+
+    for i, msg_id in enumerate(range(start_id, end_id + 1)):
+        try:
+            message = await user_client.get_messages(src, ids=msg_id)
+            if not message:
+                failed += 1
+                continue
+
+            if message.poll:
+                if await copy_poll(message, dst):
+                    processed += 1
+                else:
+                    failed += 1
+            else:
+                if message.text and settings["replace"]:
+                    new_text = message.text.replace("[REMEDICS]", "[MediX]")
+                    await user_client.send_message(dst, new_text, file=message.media)
+                else:
+                    await message.forward_to(dst)
+                processed += 1
+            
+            # Update status periodically
+            if (i + 1) % 10 == 0 or (i + 1) == total:
+                 await status_msg.edit(f"⚙️ **In Progress...**\nProcessed: {processed}/{total}\nFailed: {failed}")
+
+            await asyncio.sleep(1) # Delay to avoid flooding
+
+        except Exception as e:
+            logger.error(f"❌ Failed to process message {msg_id}: {e}")
+            failed += 1
+
+    await status_msg.edit(f"✅ **Task Complete!**\n\nProcessed: {processed}\nFailed: {failed}")
+
+# ---------------------------
+# Automatic Forward handler for NEW messages
+# ---------------------------
+@user_client.on(events.NewMessage)
+async def handler_forward_new(event):
+    src = int(settings["src"])
+    dst = int(settings["dst"])
 
     try:
         # Only forward from the source chat
-        if str(event.chat_id) != str(src):
+        if event.chat_id != src:
             return
 
         if event.poll:
-            # Special handling for polls
-            await copy_poll(event, dst)
+            # Use the modified helper for new polls
+            await copy_poll(event.message, dst)
             return
 
-        # Normal messages (text, media, etc.)
         msg = event.message
-
         if msg.text and settings["replace"]:
-            # Replace brand name in text
             new_text = msg.text.replace("[REMEDICS]", "[MediX]")
-            await client.send_message(dst, new_text, file=msg.media)
+            await user_client.send_message(dst, new_text, file=msg.media)
         else:
             await msg.forward_to(dst)
 
-        logger.info("✅ Message forwarded")
+        logger.info("✅ New message forwarded automatically")
 
-    except BadRequestError as e:
-        logger.error("❌ Telegram API error: %s", e)
-        await event.respond(f"⚠️ Failed to forward: {e}")
     except Exception as e:
-        logger.exception("❌ Unexpected error: %s", e)
-        await event.respond(f"⚠️ Error: {e}")
-
+        logger.exception(f"❌ Unexpected error in auto-forwarder: {e}")
 
 # ---------------------------
 # Main entrypoint
 # ---------------------------
 async def main():
-    await client.start()
-    logger.info("✅ Userbot logged in and running...")
-    await client.run_until_disconnected()
-
+    # Start both clients concurrently
+    await asyncio.gather(
+        user_client.start(),
+        bot_client.start(bot_token=BOT_TOKEN)
+    )
+    logger.info("✅ Both userbot and bot are logged in and running...")
+    await asyncio.gather(
+        user_client.run_until_disconnected(),
+        bot_client.run_until_disconnected()
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
