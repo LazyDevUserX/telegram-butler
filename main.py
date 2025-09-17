@@ -30,7 +30,6 @@ else:
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
-# -- BOT CLIENT & OWNER ID --
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 
@@ -39,15 +38,13 @@ user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 bot_client = TelegramClient('bot', API_ID, API_HASH)
 
 # ---------------------------
-# MODIFIED Poll copy helper
+# Poll copy helper
 # ---------------------------
 async def copy_poll(message, dst_chat):
     """Safely rebuild and send a poll from a message object."""
     try:
-        # Access the poll from the message object
         orig = message.poll.poll
 
-        # Build a new poll object
         new_poll = types.Poll(
             id=0,
             question=types.TextWithEntities(text=orig.question.text, entities=orig.question.entities or []),
@@ -62,14 +59,12 @@ async def copy_poll(message, dst_chat):
             quiz=orig.quiz
         )
 
-        # Optional solution
         solution = None
         solution_entities = None
         if message.media.results:
             solution = message.media.results.solution
             solution_entities = message.media.results.solution_entities
 
-        # Wrap into InputMediaPoll
         media = types.InputMediaPoll(
             poll=new_poll,
             correct_answers=message.media.results.correct_answers if message.media.results else None,
@@ -77,7 +72,6 @@ async def copy_poll(message, dst_chat):
             solution_entities=solution_entities
         )
 
-        # Send fresh poll using the user client
         await user_client.send_file(dst_chat, file=media)
         logger.info(f"✅ Poll from message {message.id} copied successfully")
         return True
@@ -86,7 +80,7 @@ async def copy_poll(message, dst_chat):
         return False
 
 # ---------------------------
-# NEW /forward COMMAND
+# /forward COMMAND
 # ---------------------------
 @bot_client.on(events.NewMessage(pattern=r'/forward (\d+) (\d+)', from_users=OWNER_ID))
 async def forward_range_handler(event):
@@ -97,10 +91,23 @@ async def forward_range_handler(event):
         await event.respond("❌ **Error:** Start ID must be less than or equal to End ID.")
         return
 
-    src = int(settings["src"])
-    dst = int(settings["dst"])
+    status_msg = await event.respond(f"🚀 **Starting task for range {start_id}-{end_id}...**")
+
+    try:
+        # --- IMPROVEMENT: Fetch entities before the loop to warm up the cache ---
+        src_chat_id = int(settings["src"])
+        dst_chat_id = int(settings["dst"])
+        
+        await status_msg.edit("Verifying channels...")
+        source_entity = await user_client.get_entity(src_chat_id)
+        destination_entity = await user_client.get_entity(dst_chat_id)
+        logger.info(f"Source '{source_entity.title}' and Destination '{destination_entity.title}' verified.")
+
+    except Exception as e:
+        await status_msg.edit(f"❌ **Error:** Could not access channels. Make sure the user is a member of both and the IDs in `settings.json` are correct.\n**Details:** `{e}`")
+        return
     
-    status_msg = await event.respond(f"🚀 **Processing range {start_id}-{end_id}...**")
+    await status_msg.edit(f"🚀 **Processing range {start_id}-{end_id}...**")
     
     processed = 0
     failed = 0
@@ -108,29 +115,29 @@ async def forward_range_handler(event):
 
     for i, msg_id in enumerate(range(start_id, end_id + 1)):
         try:
-            message = await user_client.get_messages(src, ids=msg_id)
+            # --- Use the full entity object for reliability ---
+            message = await user_client.get_messages(source_entity, ids=msg_id)
             if not message:
                 failed += 1
                 continue
 
             if message.poll:
-                if await copy_poll(message, dst):
+                if await copy_poll(message, destination_entity):
                     processed += 1
                 else:
                     failed += 1
             else:
                 if message.text and settings["replace"]:
                     new_text = message.text.replace("[REMEDICS]", "[MediX]")
-                    await user_client.send_message(dst, new_text, file=message.media)
+                    await user_client.send_message(destination_entity, new_text, file=message.media)
                 else:
-                    await message.forward_to(dst)
+                    await message.forward_to(destination_entity)
                 processed += 1
             
-            # Update status periodically
             if (i + 1) % 10 == 0 or (i + 1) == total:
                  await status_msg.edit(f"⚙️ **In Progress...**\nProcessed: {processed}/{total}\nFailed: {failed}")
 
-            await asyncio.sleep(1) # Delay to avoid flooding
+            await asyncio.sleep(1)
 
         except Exception as e:
             logger.error(f"❌ Failed to process message {msg_id}: {e}")
@@ -143,25 +150,24 @@ async def forward_range_handler(event):
 # ---------------------------
 @user_client.on(events.NewMessage)
 async def handler_forward_new(event):
-    src = int(settings["src"])
-    dst = int(settings["dst"])
-
+    # This handler is simple and relies on Telethon's automatic caching from recent events
     try:
-        # Only forward from the source chat
-        if event.chat_id != src:
+        src_chat_id = int(settings["src"])
+        dst_chat_id = int(settings["dst"])
+    
+        if event.chat_id != src_chat_id:
             return
 
         if event.poll:
-            # Use the modified helper for new polls
-            await copy_poll(event.message, dst)
+            await copy_poll(event.message, dst_chat_id)
             return
 
         msg = event.message
         if msg.text and settings["replace"]:
             new_text = msg.text.replace("[REMEDICS]", "[MediX]")
-            await user_client.send_message(dst, new_text, file=msg.media)
+            await user_client.send_message(dst_chat_id, new_text, file=msg.media)
         else:
-            await msg.forward_to(dst)
+            await msg.forward_to(dst_chat_id)
 
         logger.info("✅ New message forwarded automatically")
 
@@ -172,7 +178,6 @@ async def handler_forward_new(event):
 # Main entrypoint
 # ---------------------------
 async def main():
-    # Start both clients concurrently
     await asyncio.gather(
         user_client.start(),
         bot_client.start(bot_token=BOT_TOKEN)
